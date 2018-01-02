@@ -1,0 +1,1842 @@
+#+TITLE: Boot File SystemのLinux実装を読む
+
+
+今回はLinux kernel 4.14.5のfs/bfsを対象にソースコードを読んでいきます。
+
+* カーネルモジュールとしての初期化と終了
+  ファイルシステムを管理する処理はカーネル空間で実行されることになりますが、現代は様々なファイルシステムが多数存在しており、
+  その機能をすべてカーネル（一枚岩の）が担うという設計はあまり賢いとは言えません。そこで、Linuxなどの現代的なOSはファイルシステムを
+  管理する処理をカーネルモジュールに担わせ、取り外しができるような設計になっています。また、ファイルシステムごとの差異によってユーザプロセスが
+  統一的なプログラムを書けなくなったり、安直にそれを防ごうとしてカーネルの実装が複雑にならないように、カーネルは仮想ファイルシステム（Virtual File System）
+  という機構を持っています。ファイルシステムの処理を行うカーネルモジュールはVFSに対し、自らの読み書きの方法を伝えることで、ファイルシステムらしい動きができるようになります。
+  例えば、ユーザプロセスがカーネルに対しファイルを読み込むように命令した場合、カーネルはVFSに対し目的のファイルを読むように伝えます。VFSは読むべき場所のファイルシステムに
+  応じてファイルシステムカーネルモジュールから伝えられた読む方法でファイルを読み取ります。このようにLinuxは非常に合理的な方法でファイルシステムを管理しているわけです。
+
+  上で述べたようにファイルシステムの処理はカーネルモジュールが担当します。なので、通常のカーネルモジュールと同じように初期化処理と終了処理を
+  定義してやる必要があります。それではBFSの実装を見ていきましょう。
+
+# 初期化処理、終了処理関数
+#+BEGIN_SRC c
+
+static int __init init_bfs_fs(void)
+{
+        int err = init_inodecache();
+        if (err)
+                goto out1;
+        err = register_filesystem(&bfs_fs_type);
+	      if (err)
+		            goto out;
+	      return 0;
+out:
+        destroy_inodecache();
+out1:
+        return err;
+}
+
+static void __exit exit_bfs_fs(void)
+{
+        unregister_filesystem(&bfs_fs_type);
+	      destroy_inodecache();
+}
+
+#+END_SRC
+
+# 関連関数
+#+BEGIN_SRC c
+
+/////
+// fs/bfs/inode.c init_inodecache関数
+// init_bfs_fsで呼び出されている。
+/////
+static int __init init_inodecache(void)
+{
+        bfs_inode_cachep = kmem_cache_create("bfs_inode_cache",
+				        sizeof(struct bfs_inode_info),
+				        0, (SLAB_RECLAIM_ACCOUNT|
+				        SLAB_MEM_SPREAD|SLAB_ACCOUNT),
+				        init_once);
+	      if (bfs_inode_cachep == NULL)
+		            return -ENOMEM;
+	      return 0;
+}
+
+/////
+// fs/bfs/inode.c destroy_inodecache関数
+// init_bfs_fsで呼び出されている。
+/////
+static void destroy_inodecache(void)
+{
+        /*
+	      * Make sure all delayed rcu free inodes are flushed before we
+	      * destroy cache.
+	      */
+	      rcu_barrier();
+	      kmem_cache_destroy(bfs_inode_cachep);
+}
+
+/////
+// mm/slab_common.c kmem_cache_destroy関数
+// destroy_inodecache関数の最後に呼び出されている。
+/////
+void kmem_cache_destroy(struct kmem_cache *s)
+{
+        int err;
+
+	      if (unlikely(!s))
+		            return;
+
+	      get_online_cpus();
+	      get_online_mems();
+
+	      mutex_lock(&slab_mutex);
+
+	      s->refcount--;
+	      if (s->refcount)
+        		    goto out_unlock;
+
+        err = shutdown_memcg_caches(s);
+	      if (!err)
+        		    err = shutdown_cache(s);
+
+        if (err) {
+		            pr_err("kmem_cache_destroy %s: Slab cache still has objects\n",
+		                                                       s->name);
+                dump_stack();
+	      }
+out_unlock:
+        mutex_unlock(&slab_mutex);
+
+	      put_online_mems();
+	      put_online_cpus();
+}
+
+#+END_SRC
+** 初期化処理 1行目
+   init_bfs_fs関数が初期化処理となります。
+   
+   int err = init_inode_cache();
+   
+   関数名的にinodeのキャッシュを初期化するようです。その結果を変数errに代入しています。init_inodecache関数は同じinode.cに定義されています。
+   
+***  init_inodecache関数
+    最初に呼ばれているkmem_cache_create関数なのですが、これはmm/slab_common.cに定義されているカーネル関数です。
+    コメントを含めますが、70行程度のコードで実装されていますが、ここまで解説していくと、Linuxのカーネル部分全体につながり
+    なりかねないので関数定義の上部にかかれている関数を説明するコメントだけ読むことにします。
+    
+/*
+ * kmem_cache_create - Create a cache.
+ * @name: A string which is used in /proc/slabinfo to identify this cache.
+ * @size: The size of objects to be created in this cache.
+ * @align: The required alignment for the objects.
+ * @flags: SLAB flags
+ * @ctor: A constructor for the objects.
+ *
+ * Returns a ptr to the cache on success, NULL on failure.
+ * Cannot be called within a interrupt, but can be interrupted.
+ * The @ctor is run when new pages are allocated by the cache.
+ *
+ * The flags are
+ *
+ * %SLAB_POISON - Poison the slab with a known test pattern (a5a5a5a5)
+ * to catch references to uninitialised memory.
+ *
+ * %SLAB_RED_ZONE - Insert `Red' zones around the allocated memory to check
+ * for buffer overruns.
+ *
+ * %SLAB_HWCACHE_ALIGN - Align the objects in this cache to a hardware
+ * cacheline.  This can be beneficial if you're counting cycles as closely
+ * as davem.
+ */
+    
+/*
+ * kmem_cache_create - キャッシュを作成します。
+ * @name：このキャッシュを識別するために/proc/slabinfoで使用される文字列。
+ * @size：このキャッシュで作成されるオブジェクトのサイズ。
+ * @align：オブジェクトに必要な配置。
+ * @flags：SLABフラグ
+ * @ctor：オブジェクトのコンストラクタ。
+ *
+ * 成功するとキャッシュへのポインタを返し、失敗するとNULLを返します。
+ * 割り込みの中で呼び出すことはできませんが、中断することができます。
+ * @ctorは、新しいページがキャッシュによって割り当てられたときに実行されます。
+ *
+ * @flagsに使用できるフラグの例
+ * ％SLAB_POISON - 未知のメモリへの参照をキャッチする既知のテストパターン（a5a5a5a5）でスラブをマークします。
+ *
+ * ％SLAB_RED_ZONE - 割り当てられたメモリの周りに'Red'ゾーンを挿入して、バッファオーバーランをチェックします。
+ *
+ * ％SLAB_HWCACHE_ALIGN - このキャッシュ内のオブジェクトをハードワードのキャッシュラインに揃えます。 これは、davemと同じようにカウントサイクルを満たす場合に有益です。
+ */
+
+ Google翻訳9割ですがなんとなく概要をつかむことはできると思います。
+ 役割としては、一言で言うと、キャッシュを確保するということです。
+
+ kmem_cache_createでの結果は、bfsカーネルモジュール内でグローバル変数として定義されているbfs_inode_cachep変数に代入されます。
+ bfs_inode_cachepのデータ型はkmem_cache構造体へのポインタになっており、これに代入された値がNULLであれば、ENOMEMエラーを返し、
+ 正常にkmem_cacheが確保できていれば0を返す関数となっています。
+
+** 初期化処理 2~3行目
+   init_inodecacheの結果が格納されたerrをif文にかけます。上記のinit_inodecacheの仕様より、正常終了の場合は0が返り、
+   エラーの場合は0以外のエラーコードが返ってきます。なので、エラーの場合はout1ラベルにジャンプすることになり、正常終了の場合は、
+   そのまま処理が実行されることになります。
+
+** 初期化処理 4行目
+   register_filesystem関数を呼び出し変数errに代入しています。引数にはfile_system_type構造体へのポインタを渡しています。
+   file_system_type構造体については、後のグローバルな構造体変数で解説を行います。ここでは、ファイルシステムの簡易的な情報をまとめた構造体だと思ってください。
+   register_filesystem関数は関数名の通り、ファイルシステムを登録する関数です。どこに登録されるかというと、
+   カーネルのVFSが管理しているファイルシステムモジュールの連結リストに追加されます。
+   戻り値は成功すれば0が返ってきて、失敗するとEINVALエラーコードが返ってきます。
+
+** 初期化処理 5~7行目
+   上記のregister_filesystem関数の仕様より、この関数から0が返ってきた場合は、ifの条件式にかからず、そのままreturn 0で初期化が正常終了したことを
+   カーネルに伝えます。errにに-EINVALが格納されていた場合はoutラベルにジャンプすることになります。
+
+** 初期化処理 outラベル
+   destroy_inodecache関数を実行し、out1ラベルに到達します。
+*** destroy_inodecache関数
+    destroy_inodecache関数はfs/bfs/inode.cに定義されているbfsファイルシステムモジュールの一部分です。
+    実行するステートメントはたったの2行です。
+
+**** rcu_barrier関数
+    まずは上部のコメントを読むことでこの関数の概要を確認しましょう。
+
+    /*
+	   * Make sure all delayed rcu free inodes are flushed before we
+	   * destroy cache.
+	   */
+    /*
+     * キャッシュを破棄する前に、すべての遅延rcuフリーinodeがフラッシュされていることを確認してください。
+     */
+     簡単に解釈すると、次に実行されるkmem_cache_destroy関数が実行されてキャッシュが解放される前に、
+     すべての遅延したrcu処理が実行されるまで待つということらしいです。では一体rcu処理とは何なのでしょうか。
+     本来、rcuは奥深いものなのですが、今回は概要のみを解説します。
+
+**** RCU (Read-Copy Update)
+     RCUはLinuxカーネルに実装されたCPUの同期処理手法のことです。RCUはPaul E. McKenneyさんが開発者として知られています。
+     同期処理として、スピンロック、セマフォ（これはかなり有名）などがあり、RCUもその一つです。
+     RCUの同期処理方法は以下の前提があります。
+     1.ポインタ参照で扱えるデータに関して同期処理を行える。
+     2.RCUが同期処理を保証する区間では、カーネル実行パス（カーネルの命令シーケンス）の休止は無いことを保証する。
+     これらを保証し、データ読み込みを単純に行う流れは以下のようです。
+     1.カーネル実行パスはrcu_read_lockマクロでデータをロックし、データをポインタ経由で読み込む。この読み手はデータ読み込み終了まで休止してはならない。
+     2.読み込み終了後はすぐにrcu_read_unlockマクロを呼び出し、データをアンロックする。
+     これが読み手の基本動作となります。次に書き手です。ここに同期処理の秘密があります。
+     1.データ更新を行う際、まずポインタ経由でデータにアクセスし、データのクローンを別のメモリの場所に書き込む。
+     2.書き手は複製したデータに対して更新を行う。
+     3.もともとオリジナルのデータを指していたポインタを更新済みの新しいデータへのポインタに書き換える。
+     このような方法でデータへの書き込みを実現しているのですが、明らかに3の時点で読み手のデータが狂いそうな気がします。
+     ですが、狂いはしません。ポインタの値はそれぞれの読み手が持つアトミックなデータで、どれも古いデータか新しいデータ
+     のどちらかを参照することになります。とりあえず、これでデータの矛盾は発生しません。ただし、他CPUの更新が完了したあとに
+     データを読み込む者に対しては必ず更新済みの情報がアクセスされるようにならなくてはならないため、ポインタ入れ替え時は
+     メモリバリアを行う必要があります。
+     RCUの問題点は、書き手がポインタを入れ替えたあと、すぐにはオリジナルのデータを解放することができないというところです。
+     なぜなら、データ更新前のポインタを参照しているプログラムの動作が破壊されてしまう可能性があるためです。
+     なので、カーネルは読み手のすべてのプログラムがrcu_read_unlockマクロを呼ぶことを期待しています。
+     すべての読み手がrcu_read_unlockマクロを実行した時点で、call_rcu関数を呼び出します。call_rcu関数は、すべてのCPUで
+     古いデータが参照されていないことを確認したあと、引数で受け取ったコールバック関数をを呼び出しすべての古いデータを削除することになります。
+     こうして、同期処理を達成することになります。
+
+**** kmem_cache_destroy関数
+     名前と一行目のkmem_cache_create関数との対とで大体意味はわかると思います。まあ引数にとったkmem_cache構造体へのポインタが指すデータを
+     解放する役目があるのでしょう。まあそう決めつけるのは良くないのでソースコードを少しだけ読んでみます。
+     エラーチェックなどを行ったあと、shutdownなんちゃらを呼び出しています。やはり、kmem_cacheを正しい方法で解放するといった仕事をしている
+     ようです。例の理由で奥までは突っ込みません。とりあえずはこれでdestroy_inodecache関数の解説は以上となります。
+
+** 初期化処理 out1ラベル
+   エラーコードが格納されているであろうerr変数を返す。
+** 終了処理 1行目
+   unregister_filesystem関数を呼び出しているだけです。引数にはfile_system_type構造体へのポインタを渡しています。
+   この関数は初期化処理4行目のregister_filesystem関数と対になる関数です。仕事はregister_filesystem関数によって
+   登録されたファイルシステムモジュールを登録解除する関数になります。簡単ですね。実際の実装には今回は触れません。
+   unregister_filesystem関数には戻り値があるのですが、このBFS実装ではその戻り値を利用せず捨てています。
+   戻り値としては、成功時に0が返り、失敗時はEINVALエラーコードが返ってきます。
+   x
+** 終了処理 2行目
+   destroy_inodecache関数を呼び出しています。この関数については初期化処理 outラベルにて解説を行ったので、ここでは解説しません。
+   とりあえずこれで終了処理は終わりとなります。
+xx
+* マウント処理
+** マウントコールバック関数
+   カーネルのmountシステムコールが呼び出されると、ファイルシステムモジュールから予め教えられていた処理を実行します。
+   その実態が以下のbfs_mount関数です。file_system_type構造体のmountフィールドにセットされることによってカーネルに
+   処理を登録することができます。ではこのbfs_mount関数について解説していきたいと思います。
+#+BEGIN_SRC c
+
+static struct dentry *bfs_mount(struct file_system_type *fs_type,
+        int flags, const char *dev_name, void *data)
+{
+        return mount_bdev(fs_type, flags, dev_name, data, bfs_fill_super);
+}
+
+#+END_SRC
+*** 引数
+**** 第一引数
+     struct file_system_type *type
+     これはmountシステムコールで指定されたファイルシステムのfile_system_type構造体へのポインタになります。
+     通常自らのfile_system_type構造体へのポインタになることが予想されます。
+**** 第二引数
+     int flags
+     mountシステムコールで指定されたフラグ
+**** 第三引数
+     char *dev_name
+     mountシステムコールで指定されたデバイス名
+**** 第四引数
+     void *data
+     mountシステムコールで指定されたマウントオプション
+*** 返り値
+    struct dentry *
+    マウントするファイルシステムのルートのディレクトリエントリ
+** マウントコールバック関数 1行目
+*** 概要
+   mount_bdev関数を呼び出し、その返り値をそのまま返しています。mount_bdev関数は仮想ファイルシステム層で実装されている関数で、
+   共通処理となるマウント処理を行ってくれます。今回はmount_bdev関数のソースコードは読みません。
+   ちなみにmount_bdevのbdevはBlock Deviceのことで、ブロック型のデバイス用のマウント処理ということになります。
+   ブロック型以外用のファイルシステム（ramfsなど）のファイルシステムの実装では、mount_bdev関数ではなく、mount_nodev関数を用いることになります。
+   BFSはブロック型デバイス用のファイルシステムなのでmount_bdev関数を呼び出しています。
+*** 注意
+    オライリージャパンから出版されている「詳解Linuxカーネル第3版」(2017/12/26現在最新版)を見ると、この部分の記述においていろいろと古い情報が載っていて、
+    file_system_type構造体のmountフィールドはまだ実装されておらず、古いものとしてget_sbフィールドが使われていました。
+    それによって当時のbfsはbfs_mountではなくbfs_get_sb関数が定義されており、内部の実装ではmount_bdev関数ではなく、get_sb_bdev関数が使われていました。
+    実はLinux2.6.37-rc1の時、コミット'c96e41e92b4aaf11e1f9775ecf0d1c8cbff829ed'(2010/7/25)によって、get_sbからmountに移行されています。
+    つまり、それ以前のLinuxにおけるファイルシステムモジュールの実装は現在のものと少し違うものとなっているということになります。
+    詳解Linuxカーネル第三版の日本語版の初版第一刷は2007年で、初期のLinux2.6を対象に書かれているので情報が古いものとなってしまっているのです。
+    ネット上の情報にも、この古い記述がいくらかあったので、ちゃんと調査して見極めるようにしましょう。
+    （オライリーから英語のLinuxデバイスドライバ第4版が出版されるようです。日本語版が出るかどうかはわかりませんが。これに続いて詳解Linuxカーネル第4版が出るといいですね。）
+*** mount_bdev関数
+    mount_bdev関数の簡単な役割はわかったところで具体的な使用方法を見ていきます。
+**** 引数
+     | 型                        | 変数名     | 説明                                                                                   |
+     | struct file_system_type * | fs_type    | マウントシステムコールで指定されたファイルシステムのfile_system_type構造体へのポインタ |
+     | int                       | flags      | mountシステムコールで指定されたマウントフラグ                                          |
+     | const char *              | dev_name   | mountシステムコールで指定されたデバイス名                                              |
+     | void *                    | data       | mountシステムコールで指定されたマウントオプション                                      |
+     | int (*)(...)              | fill_super | ファイルシステム固有のスーパブロック読み込み関数へのポインタ                           |                                                                                                                                  |
+**** 返り値
+     struct dentry *
+     ファイルシステムのルートのディレクトリエントリ
+     失敗時にはNULLもしくはエラーを表すポインタを返す必要がある。
+**** 具体的な動作
+     引数として受け取るfill_super関数を呼び出し、スーパブロックの解析を行う。
+     fill_super関数についてはこの後、説明を行います。
+** fill_super関数
+   fill_super関数を一言で言い表すならば、ファイルシステムのスーパブロックを解析し、VFSに内容を伝えるといったところでしょうか。
+   では、動作を順を追って見ていきましょう。
+   fill_super関数の動作
+   1.ディスクからスーパブロックを読み取る。
+   2.読み出したスーパブロックの各々のデータをVFS側が提供するスーパブロックオブジェクトに設定する。
+   3.ディスクからファイルシステムのルートのinodeを読み取る。
+   4.VFSのinodeオブジェクトを確保し、3で読み込んでいたinode情報を設定する。
+   5.ルートのディレクトリエントリを確保し、4で手に入れたinode情報とひも付けする。
+   6.5でひも付けしたルートのディレクトリエントリを返す。
+   
+   LinuxのBFS実装ではfs/bfs/inode.c bfs_fill_super関数がmount_bdev関数に渡され、
+   fill_super関数の役割を担っています。ではその中身を見ていくことにしましょう。
+** bfs_fill_super関数
+   いきなりたくさんの変数が定義されています。今回は'info = kzalloc(sizeof(*info), GFP_KERNEL);'を1行目として解説を行っていきます。
+   関連コードを以下に示しておきます。
+# 関連コード
+#+BEGIN_SRC c
+/////
+// fs/bfs/bfs.h bfs_sb_info構造体
+/////
+/*
+ * BFS file system in-core superblock info
+ */
+struct bfs_sb_info {
+        unsigned long si_blocks;
+        unsigned long si_freeb;
+        unsigned long si_freei;
+        unsigned long si_lf_eblk;
+        unsigned long si_lasti;
+        unsigned long *si_imap;
+        struct mutex bfs_lock;
+};
+
+/////
+// include/linux/fs.h super_block構造体
+/////
+struct super_block {
+	struct list_head	s_list;		/* Keep this first */
+	dev_t			s_dev;		/* search index; _not_ kdev_t */
+	unsigned char		s_blocksize_bits;
+	unsigned long		s_blocksize;
+	loff_t			s_maxbytes;	/* Max file size */
+	struct file_system_type	*s_type;
+	const struct super_operations	*s_op;
+	const struct dquot_operations	*dq_op;
+	const struct quotactl_ops	*s_qcop;
+	const struct export_operations *s_export_op;
+	unsigned long		s_flags;
+	unsigned long		s_iflags;	/* internal SB_I_* flags */
+	unsigned long		s_magic;
+	struct dentry		*s_root;
+	struct rw_semaphore	s_umount;
+	int			s_count;
+	atomic_t		s_active;
+#ifdef CONFIG_SECURITY
+	void                    *s_security;
+#endif
+	const struct xattr_handler **s_xattr;
+
+	const struct fscrypt_operations	*s_cop;
+
+	struct hlist_bl_head	s_anon;		/* anonymous dentries for (nfs) exporting */
+	struct list_head	s_mounts;	/* list of mounts; _not_ for fs use */
+	struct block_device	*s_bdev;
+	struct backing_dev_info *s_bdi;
+	struct mtd_info		*s_mtd;
+	struct hlist_node	s_instances;
+	unsigned int		s_quota_types;	/* Bitmask of supported quota types */
+	struct quota_info	s_dquot;	/* Diskquota specific options */
+
+	struct sb_writers	s_writers;
+
+	char			s_id[32];	/* Informational name */
+	uuid_t			s_uuid;		/* UUID */
+
+	void 			*s_fs_info;	/* Filesystem private info */
+	unsigned int		s_max_links;
+	fmode_t			s_mode;
+
+	/* Granularity of c/m/atime in ns.
+	   Cannot be worse than a second */
+	u32		   s_time_gran;
+
+	/*
+	 * The next field is for VFS *only*. No filesystems have any business
+	 * even looking at it. You had been warned.
+	 */
+	struct mutex s_vfs_rename_mutex;	/* Kludge */
+
+	/*
+	 * Filesystem subtype.  If non-empty the filesystem type field
+	 * in /proc/mounts will be "type.subtype"
+	 */
+	char *s_subtype;
+
+	const struct dentry_operations *s_d_op; /* default d_op for dentries */
+
+	/*
+	 * Saved pool identifier for cleancache (-1 means none)
+	 */
+	int cleancache_poolid;
+
+	struct shrinker s_shrink;	/* per-sb shrinker handle */
+
+	/* Number of inodes with nlink == 0 but still referenced */
+	atomic_long_t s_remove_count;
+
+	/* Being remounted read-only */
+	int s_readonly_remount;
+
+	/* AIO completions deferred from interrupt context */
+	struct workqueue_struct *s_dio_done_wq;
+	struct hlist_head s_pins;
+
+	/*
+	 * Owning user namespace and default context in which to
+	 * interpret filesystem uids, gids, quotas, device nodes,
+	 * xattrs and security labels.
+	 */
+	struct user_namespace *s_user_ns;
+
+	/*
+	 * Keep the lru lists last in the structure so they always sit on their
+	 * own individual cachelines.
+	 */
+	struct list_lru		s_dentry_lru ____cacheline_aligned_in_smp;
+	struct list_lru		s_inode_lru ____cacheline_aligned_in_smp;
+	struct rcu_head		rcu;
+	struct work_struct	destroy_work;
+
+	struct mutex		s_sync_lock;	/* sync serialisation lock */
+
+	/*
+	 * Indicates how deep in a filesystem stack this SB is
+	 */
+	int s_stack_depth;
+
+	/* s_inode_list_lock protects s_inodes */
+	spinlock_t		s_inode_list_lock ____cacheline_aligned_in_smp;
+	struct list_head	s_inodes;	/* all inodes */
+
+	spinlock_t		s_inode_wblist_lock;
+	struct list_head	s_inodes_wb;	/* writeback inodes */
+} __randomize_layout;
+
+/////
+// fs/block_dev.c set_blocksize関数
+// sb_set_blocksize関数から呼び出されている
+// bfs_super_fill関数の6行目を読む時にこの関数み確認すること
+/////
+int set_blocksize(struct block_device *bdev, int size)
+{
+        /* Size must be a power of two, and between 512 and PAGE_SIZE */
+	      if (size > PAGE_SIZE || size < 512 || !is_power_of_2(size))
+		            return -EINVAL;
+
+	      /* Size cannot be smaller than the size supported by the device */
+	      if (size < bdev_logical_block_size(bdev))
+        		    return -EINVAL;
+
+	      /* Don't change the size if it is same as current */
+	      if (bdev->bd_block_size != size) {
+        		    sync_blockdev(bdev);
+		            bdev->bd_block_size = size;
+		            bdev->bd_inode->i_blkbits = blksize_bits(size);
+		            kill_bdev(bdev);
+	      }
+	      return 0;
+}
+
+/////
+// include/linux/blkdev.h
+// sb_set_blocksizeから呼び出されている。
+/////
+/* assumes size > 256 */
+static inline unsigned int blksize_bits(unsigned int size)
+{
+        unsigned int bits = 8;
+	      do {
+		            bits++;
+		            size >>= 1;
+	      } while (size > 256);
+	      return bits;
+}
+
+/////
+// fs/block_dev.c sb_set_blocksize関数
+// bfs_super_fill関数の6行目で呼び出されている。
+// bfs_super_fill関数の6行目を読む時にこの関数み確認すること
+/////
+int sb_set_blocksize(struct super_block *sb, int size)
+{
+        if (set_blocksize(sb->s_bdev, size))
+		            return 0;
+	      /* If we get here, we know size is power of two
+	      * and it's value is between 512 and PAGE_SIZE */
+	      sb->s_blocksize = size;
+	      sb->s_blocksize_bits = blksize_bits(size);
+	      return sb->s_blocksize;
+}
+
+/////
+// include/uapi/linux/bfs_fs.h
+// BFS実装中に使われる定数群
+/////
+#define BFS_BSIZE_BITS		9
+#define BFS_BSIZE		(1<<BFS_BSIZE_BITS)
+
+#define BFS_MAGIC		0x1BADFACE
+#define BFS_ROOT_INO		2
+#define BFS_INODES_PER_BLOCK	8
+
+/////
+// include/uapi/linux/bfs_fs.h bfs_super_block構造体
+// BFS実装のスーパブロック構造体
+/////
+/* BFS superblock layout on disk */
+struct bfs_super_block {
+        __le32 s_magic;
+	      __le32 s_start;
+	      __le32 s_end;
+	      __le32 s_from;
+	      __le32 s_to;
+	      __s32 s_bfrom;
+	      __s32 s_bto;
+	      char  s_fsname[6];
+	      char  s_volume[6];
+	      __u32 s_padding[118];
+};
+
+/////
+// include/linux/buffer_head.h
+/////
+/*
+ * Historically, a buffer_head was used to map a single block
+ * within a page, and of course as the unit of I/O through the
+ * filesystem and block layers.  Nowadays the basic I/O unit
+ * is the bio, and buffer_heads are used for extracting block
+ * mappings (via a get_block_t call), for tracking state within
+ * a page (via a page_mapping) and for wrapping bio submission
+ * for backward compatibility reasons (e.g. submit_bh).
+ */
+struct buffer_head {
+        unsigned long b_state;		/* buffer state bitmap (see above) */
+	      struct buffer_head *b_this_page;/* circular list of page's buffers */
+	      struct page *b_page;		/* the page this bh is mapped to */
+
+	      sector_t b_blocknr;		/* start block number */
+	      size_t b_size;			/* size of mapping */
+	      char *b_data;			/* pointer to data within the page */
+        
+	      struct block_device *b_bdev;
+	      bh_end_io_t *b_end_io;		/* I/O completion */
+ 	      void *b_private;		/* reserved for b_end_io */
+	      struct list_head b_assoc_buffers; /* associated with another mapping */
+	      struct address_space *b_assoc_map;	/* mapping this buffer is
+						   associated with */
+	      atomic_t b_count;		/* users using this buffer_head */
+};
+
+#+END_SRC
+*** 1行目
+    bfs_sb_info構造体のメモリを確保しています。
+*** 2~3行目
+    メモリ1行目のメモリ確保が失敗していた場合、ENOMEMエラーコードを返し、それ以外はそのまま続行します。
+*** 4行目
+    bfs_sb_infoのbfs_lockフィールドはmutex構造体として宣言されています。この初期化を行っています。
+    bfs_fill_super関数のみを見ていると、この関数終了のあたりでmutex_destroy関数が呼ばれ、破棄される
+    ことになっており、なぜ使いもしないのに初期化をしているのかと疑問を抱くと思います。これは後でわかります。
+*** 5行目
+    super_block構造体のs_fs_infoフィールドは宣言の横にあるコメントを見ると/* Filesystem private info */と書いてあります。
+    つまり、このメンバはファイルシステムモジュールごとに自由に設定できる変数ということになり、BFS実装では自らの情報を表すbfs_sb_info
+    構造体へのポインタを代入しています。ちなみにこのs変数は引数で渡されているもので、VFSからファイルシステムモジュール側に渡されているものです。
+*** 6行目
+    sb_set_blocksize関数にsuper_block構造体へのポインタとBFS_BSIZEという定数が渡されています。
+    BFS_BSIZEは一見どこに定義されているのかわかりません。BFS_BSIZEはBFSのソースコードが置かれている
+    fs/bfsディレクトリ中のソースファイルのどこにも定義されておらず、定義はinclude/uapi/linux/bfs_fs.h
+    に定義されています。定義としては1をBFS_BSIZE_BITSだけ左シフトするというものなっていて、BFS_BSIZE_BITSは
+    9で定義されているので1 << 9で定義されることになります。(つまり512)
+    そして、sb_set_blocksize関数とそこの中で呼び出されているset_blocksize関数の定義を見て見ると、
+    エラーチェックをしてから、引数として受け取ったsuper_block構造体のblocksizeフィールドに第二引数のBFS_BSIZEを、
+    s_blocksize_bitsフィールドにblksize_bits関数の結果を代入しています。
+*** 7行目
+    sb_read関数にsuper_block構造体へのポインタと0を渡し、その結果をbuffer_head構造体へのポインタ変数であるsbhに格納しています。
+**** sb_read関数
+     指定されたスーパーブロック構造体に対応したブロックデバイスの指定された論理ブロックを読み込みます。
+     その結果はバッファキャッシュを表すbuffer_head構造体へのポインタを返します。すでにバッファキャッシュとして
+     キャッシュされていた場合は何もせずそのポインタを返し、キャッシュされていない場合はディスクを読みに行き、
+     バッファキャッシュを作り出してから、そのポインタを返します。この関数が失敗すると、NULLが返ってきます。
+***** 論理ブロック番号
+      物理的なディスクの先頭からの番号ではなく、各パーティションの先頭からの相対番号を表す。
+      今回は0を渡しています。0はファイルシステムの最初のブロックで、通常最初のブロックはスーパブロックとなっています。
+*** 8~9行目
+    sb_read関数の結果が格納されているsbhがNULLであれば、outラベルに飛び、成功していれば、そのま続行します。
+*** 10行目
+    buffer_head構造体のb_dataフィールドはディスクのブロックデータがキャッシュされたメモリ領域へのポインタです。
+    それをbfs_super_block構造体へのポインタにキャストしてbfs_sb変数に代入しています。
+    ここで、キャッシュされていたデータはスーパブロックのデータになっています。このキャッシュのサイズはブロックサイズと等しく、
+    BFS_BSIZEは512なので512バイトになります。そして、bfs_super_block構造体の定義を見てみると、ファイルシステムを表すフィールドが
+    並んだ後に、paddingフィールドを使用してピッタリ512バイトになるように調整されています。つまり、この行の意味としては、
+    sbh変数にスーパブロックのデータを代入しているということになります。
+*** 11~16行目
+**** 11行目
+     スーパブロックに書き込まれていたマジックナンバーがBFSを表すマジックナンバーと等しいか確認をしています。
+     le32_to_cpuは引数をリトルエンディアンに変換するマクロです。デバイスによってリトルエンディアンとビッグエンディアン
+     のどちらを使っているかわからないため、比較を行う場合はリトルエンディアンで統一しているというわけです。
+     ちなみに多くのデバイスはIntelの成功によってリトルエンディアンを採用しています。
+***** ファイルシステムのマジックナンバー
+      BFSのマジックナンバーは#define BFS_MAGIC 0x1BADFACEとして定義されています。
+**** 12~15行目 
+     マジックナンバーが不一致だった場合はこの行に飛んできます。
+     最初のif(!silent)ですが、おそらくこのsilentはカーネルの設定のことだと思われます。
+     つまり、silentが有効化されていない場合は、エラーメッセージを出力するということです。
+     その後は、out1へジャンプします。
+*** 17行目
+    BFS_UNCLEANマクロの結果が真かつサイレントが有効化されていない場合、s->id is uncleanと表示するようです。
+    では、BFS_UNCLEANマクロの定義を見てみます。
+#+BEGIN_SRC c
+    #define BFS_UNCLEAN(bfs_sb, sb)	\
+	((le32_to_cpu(bfs_sb->s_from) != -1) && (le32_to_cpu(bfs_sb->s_to) != -1) && !(sb->s_flags & MS_RDONLY))
+#+END_SRC
+     これを日本語に起こすとすれば、以下のようになると思います。
+     bfs_sbのs_fromフィールドは1で埋め尽くされていない（-1はすべてのbitでFの羅列）
+     かつ
+     bfs_sbのs_toフィールドは1で埋め尽くされていない
+     かつ
+     sbのs_flagsフィールドはMS_RDONLYフラグが立っていない(MS_RDONLYは1で定義されている)
+     このとき真
+     ということになります。つまり、ここで言うCLEANとはすべて1で満たされているということなんでしょう。
+     そして、17行目のコードの方に戻ると、よく意味がわかると思います。
+     1で埋め尽くされていない場合で、サイレント状態ではない場合、uncleanであると出力するわけですね。
+*** 18行目
+    super_block構造体のs変数のs_magicフィールドにBFSファイルシステムのマジックナンバーを格納しています。
+    VFSに自らの情報を伝えているわけですね。
+*** 19~22行目
+    bfs_sbのs_startフィールドとs_endフィールドを比較しています。
+    そして、s_startフィールドの方が大きい場合、サイレントが有効化されているかに問わず、"Superblock is corrupted"と出力しています。
+    このメッセージを日本語に訳すと、スーパブロックが破損しています。という意味になります。
+    まあそうでしょう。データ領域のスタートがデータ領域のエンドよりも遅いのですから。
+    エラーメッセージを出力した後は、out1へジャンプします。
+*** 23~25行目
+    いろいろと計算した値をinfo変数（bfs_sb_info構造体へのポインタ）のsi_lastiフィールドに代入しています。
+    このsi_lastiフィールドはBFSパーティションの最後のinodeのinode番号を表します。名前も少しそれっぽいです。
+    このいろいろ計算している部分を理解するためにようやくBFSの構造について見ていきます。（筆者はコードだけでちょろまかそうとして意味分からなくなったので）
+    [[file:~/Dropbox/fs_docs/bfs_table.png]]
+    また、詳しいBFSの構造を確認したい場合は、http://martin.hinner.info/fs/bfs/bfs-structure.html にアクセスすると良いでしょう。
+    この計算を表す画像を用意したので、これもどうぞ。
+    [[file:~/Dropbox/fs_do0cs/bfs_table2.png]]
+    つまり、(le32_to_cpu(bfs_sb->s_start) - BFS_BSIZE)はデータ領域の開始位置(byteオフセット)-1ブロックのサイズ（スーパブロックは1ブロック分のサイズ）
+    の計算式で、inode領域のサイズ（byte）が得られます。これをinode１つ当たりのサイズで割れば、inode領域に格納できるinodeの数が得られます。
+    ここでもし、inode番号が0から始まっていた場合、inode領域の最後のinodeのinode番号は格納できるinodeの数-1ということになります。
+    BFSでは最初のinode(このinodeはinode領域の先頭から存在している)であるルートのinodeのinode番号は2から始まっている。
+    BFS_ROOT_INOを足すことによってinodeの開始番号を合わせて、最後のinodeのinode番号が計算できるというわけである。
+    そして、この値は、bfs_sb_info構造体のsi_lastiフィールドに代入される。
+*** 26~27行目
+    imap_len = (info->si_lasti / 8) + 1;
+    まず、unsigned型で定義されたimap_len変数に最後のinodeのinode番号を8で割った値に1を足した値（紛らわしので、ソースコードを見た方がわかりやすい）
+    を代入しています。
+    27行目では、imap_lenバイトのメモリを確保しゼロクリアしたものをinfo変数のsi_imapフィールドに代入しています。
+    これで何ができるかというと、1bitの0,1をinodeの予約状況に見立てて処理を行うことができるのです。なので、26行目では、最後のinodeのinode番号
+    を8で割った値に1を足した値をimap_lenに代入しているのです。1バイトは8bitですから、1バイトで8個のinodeの予約状況を格納しておけるということになります。
+*** 28~29行目
+    27行目のkzallocが成功しているかをチェックしています。もし、失敗していて、NULLが返ってきていた場合はout1にジャンプします。
+*** 30~31行目
+    ここに来てアセンブリ言語の知識がほんの少し必要になります。まあ、分からなくても、動作が分かればいいので軽く行きましょう。
+    (筆者はアセンブリの部分では無く、また違うところでつまずきました。)
+    for文で0~BFS_ROOT_INO-1までループします。そこで行う処理はset_bit関数を実行するだけです。set_bit関数はもはや名前から何をするかわかりますが、
+    一応説明します。set_bit関数の中身はインラインアセンブリで書かれています。なのでアーキテクチャごとに実装が異なるのですが、今回はx86の実装について見ていきます。
+#+BEGIN_SRC c
+/////
+// arch/x86/include/asm/bitops.h set_bit関数
+/////
+/**
+ * set_bit - Atomically set a bit in memory
+ * @nr: the bit to set
+ * @addr: the address to start counting from
+ *
+ * This function is atomic and may not be reordered.  See __set_bit()
+ * if you do not require the atomic guarantees.
+ *
+ * Note: there are no guarantees that this function will not be reordered
+ * on non x86 architectures, so if you are writing portable code,
+ * make sure not to rely on its reordering guarantees.
+ *
+ * Note that @nr may be almost arbitrarily large; this function is not
+ * restricted to acting on a single-word quantity.
+ */
+static __always_inline void
+set_bit(long nr, volatile unsigned long *addr)
+{
+        if (IS_IMMEDIATE(nr)) {
+		            asm volatile(LOCK_PREFIX "orb %1,%0"
+			          : CONST_MASK_ADDR(nr, addr)
+			          : "iq" ((u8)CONST_MASK(nr))
+			          : "memory");
+	      } else {
+		            asm volatile(LOCK_PREFIX "bts %1,%0"
+			          : BITOP_ADDR(addr) : "Ir" (nr) : "memory");
+	      }
+}
+
+#+END_SRC
+    とりあえず、IMMEDIATEでは無い場合を見ます。実行される命令はbts命令です。bts命令は、第一オペランドの示すビット配列の中で、
+    第二オペランドが示すビット位置のビットをCF(キャリーフラグ)に入れ、そのビットには1をセットするという命令です。
+    結果的に、指定したビットは1になります。
+    つまり、ゼロクリアされたinfo->si_imapの最上位ビットと次のビットを1にするということです。
+    あれ？BFS_ROOT_INOは2だから最上位ビットと次のビットが1になることはいいのですが、なんでこの二つを1にする必要があるのでしょう。（筆者はここでつまずきました）
+    inode領域の先頭、オフセット0の地点にルートのinodeが存在しているならば、si_imapの場合も最上位ビットをルートとして扱えばわかりやすいのになぜだろう。
+    答えとしては、inode領域の並びとsi_imapの並びを同じにする必要が無いというものでした。si_imapにはinode番号のオフセット分、直にアクセスでき、ディスクの読み取り
+    では（後に解説します）inode番号-BFS_ROOT_INOを行い（find_inode関数）、ルートを0にしてアクセスしています。inode取得側ではinode番号を加工せずにiget_locked関数を
+    使って読み取ろうとしています。このiget_locked関数では、すでにそのinode番号がキャッシュされているかどうかのところでinode番号が使われ
+    、キャッシュされてなければfind_inode関数が呼ばれることになるので、inode番号を直に使ってディスクアクセスはしません。
+    また、imap_lenの計算で+1していたことが効いているので、オーバーフローはしません。
+    話を戻すと、si_imapの最上位ビットと次のビットはどうせ使わないので、1にしておこうという処理になっています。
+*** 32行目
+    グローバル変数として宣言されているsuper_operations構造体のbfs_sops変数をsuper_block構造体のs_opフィールドに格納しています。
+    super_operations構造体についてはグローバルな構造体変数の章で解説を行います。とりあえず、スーパブロックに関する
+    関数をまとめたものだと思ってください。
+*** 33行目
+    inode構造体のinode変数にbfs_iget関数の結果を格納しています。bfs_iget関数はfs/bfs/inode.cに定義されている関数で、後で解説します。
+    簡単な役割としては、super_block構造体へのポインタと、inode番号を渡すと、そのinode番号に対応したinode構造体を取ってきてくれるという感じです。
+    失敗した場合、エラーポインタを返してきます。エラーポインタについても後で解説します。
+    本題に戻ると、bfs_iget関数にsuper_block構造体へのポインタと、BFS_ROOT_INOを渡しているので、BFSのルートディレクトリのinodeが返ってくるため。
+    inode変数にはルートディレクトリに対応したinode構造体へのポインタが格納されると言うことになります。
+*** 34行目
+    inode変数をIS_ERRマクロを使って検査しています。IS_ERRマクロは検査対象がエラーコードポインタだった場合真になります。
+**** IS_ERRインライン関数
+     IS_ERRマクロとして紹介しましたが、実際はインライン関数として定義されており。中ではIS_ERR_VALUEマクロを実行しています。
+     この関数の実装は非常に興味深い点があるので、BFSの解説とは遠のくのですが、見てみることにしましょう。
+#+BEGIN_SRC c
+/////
+// IS_ERR関数
+// include/linux/err.h
+/////
+static inline bool __must_check IS_ERR(__force const void *ptr)
+{
+        return IS_ERR_VALUE((unsigned long)ptr);
+}
+
+/////
+// IS_ERR_VALUEマクロ
+// include/linux/err.h
+/////
+#define IS_ERR_VALUE(x) unlikely((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
+#+END_SRC
+      unlikelyマクロはコンパイラの機能で、条件式がfalseになることが多いとコンパイラに伝えるマクロです。
+      こうすることにより、falseになる場合が有利なようにアセンブラを吐くようになります。
+      IS_ERR_VALUEマクロがやっていることは、引数で受け取った値xがエラー示しますコードの最大値の-をunsigned longでキャストしたもの
+      より大きいか？という判定です。なぜこんな処理でエラーコードの判定ができるのでしょうか。その理由を以下に示します。
+      Linuxのエラーコードは-1 ~ -4095です。(定義では1~4095ですが、通常マイナス演算を行い、負の数に変換するため)
+      それをマイナス演算を行い、unsigned longにキャストします。ここで、例としてよく見るエラーのENOMEMを使います。
+      ENOMEMはinclude/uapi/asm-generic/errno-base.hで12として定義されています。通常、エラーコードはマイナス演算されるので、
+      -12がxに格納されていると思ってください。IS_ERR関数や、IS_ERR_VALUEマクロで散々unsigned long型にキャストされています。
+      なので、bitで見ると、fffff...f3くらいになると思います。これと(unsigned long)-MAX_ERRNO、bitで見るとff...ff001
+      を比較すると、-ENOMEMの方が大きくなり、IS_ERRはtrueを返すことになります。これはエラーコードの範囲である-1 ~ -4095でtrue
+      となり、その他ではfalseとなるので、エラーチェックができているということになります。こうすることにより、比較回数を1回で
+      済ませることができるため、高速化が図れるというわけです。（多分）
+      
+*** 35行目
+    int型変数retにPTR_ERRインライン関数にinode変数を渡して得られた返り値を代入しています。
+    PTR_ERRインライン関数の中身は単純で以下のようになっています。
+#+BEGIN_SRC c
+static inline long __must_check PTR_ERR(__force const void *ptr)
+{
+        return (long) ptr;
+}
+#+END_SRC
+    渡されたポインタをlongにキャストして返しているだけです。つまり、エラーコードだったinode変数をlongにキャストしてretに
+    代入しているということです。retは最終的にreturnされるので、エラーコードをそのまま返しに行くということですね。
+*** 36~37行目
+    retにinode変数をlongにキャストしたものを代入したあとはout2ラベルにジャンプして終了です。
+*** 38行目
+    ここでは、スーパーブロック構造体へのポインタであるsのs_rootフィールドにd_make_rootという怪しい関数にinodeを渡し、
+    その結果を代入しています。これはファイルシステムのルートディレクトリをVFSに伝える必要があるため、行っています。
+    d_make_root関数に渡しているinodeはルートディレクトリのものでした。d_make_root関数はルートディレクトリのinodeを受け取り、
+    成功すれば、ルートディレクトリのディレクトリエントリを表すdentry構造体へのポインタを返します。失敗すると、NULLを返します。
+    この返ってくるディレクトリエントリは渡したinodeと紐付けされている状態にあります。本来はもっと一般化されたd_instantiate関数
+    を使用しますが、ルートディレクトリだけは。d_make_root関数を使います。内部では普通にd_instantiateを使っています。
+    話を戻すと、ルートのinodeに紐付けされたdentry構造体へのポインタをスーパーブロック構造体のs_rootフィールドに代入することによって
+    VFSにルートディレクトリのディレクトリエントリを伝えることができるわけです。d_instantiate関数やディレクトリエントリについては、
+    後でまた説明します。
+*** 39~4２行目
+    d_make_root関数は失敗するとNULLが返るので、そのチェックを行い、NULLだった場合は、ret変数に-ENOMEMを代入、out2ラベル
+    にジャンプして終了という形になります。
+*** 43行目
+    bfs_sb_info構造体へのポインタであるinfo変数から参照して、si_blocksフィールドに何らかの値を代入しています。
+    これは何なのかというと、BFSファイルシステムのブロック数を計算して代入しています。
+    どのように計算しているかというと、まず、bfs_sb->s_endで、データ領域終了地点（BFS終了地点）のバイトオフセットを取得します。
+    つまり、BFSの総バイト数ということですね。これに1を足します。これはオフセットがブロックサイズ-1になった場合の対策です。
+    あとはこれを1ブロック当たりのサイズで割れば、総ブロック数が得られます。実装上はBFS_BSIZE_BITS分右シフトしています。
+    BFS_BSIZE_BITSは9として定義されています。なので、512だけ割ったことになります。BFS_BSIZEは1<<BFS_BSIZE_BITSで定義
+    されているので、ちょうど1ブロック当たりのサイズで割ったことになるんですね。
+*** 44行目
+    bfs_sb_info構造体へのポインタであるinfo変数から参照して、si_freebフィールドにいろいろ計算したものを代入しています。
+    ではその計算内容を見ていくことにしましょう。
+    まず、(le32_to_cpu(bfs_sb->s_end) + 1 - le32_to_cpu(bfs_sb->s_start))です。
+    これはファイルシステムの終端のバイトオフセットに1を足したものから、ファイルシステムのデータ領域の始点のバイトオフセット
+    を引いています。BFSは大きく3領域に分けることができ、前から順番にスーパブロック、inode領域、データ領域と並んでいます。
+    すなわち、上の計算式で得られるものはバイト数ということになります。1を足しているのは普通予想できると思いますが、コンピューター
+    特有の0から始まるというやつで、s_startのバイトオフセットもデータ領域であるので、通常の引き算では1足りなくなるためです。
+    そして、それをBFS_BSIZE_BITS分だけ右シフトしています。43行目と同様で、これは1ブロック当たりのサイズである512で割った
+    ということになるので、si_freebフィールドにはデータ領域の持つブロック数が代入されるということになります。
+*** 45~46行目
+    bfs_sb_info構造体へのポインタであるinfo変数から参照して、si_freei, si_lf_eblkフィールドに0を代入しています。
+    この行は情報が少なすぎてよくわかりません。構造体名から察するに、si_freeiはフリーなinodeの数でしょうか。
+    si_lf_eblkはもう意味わかりません。blkはおそらくblockのことで、eはemptyでしょうか。lfは検討も着きません。
+    おそらくどこかの領域には空のブロックは0だということを言いたいのだと思います。（憶測）
+**** 追記
+     ソースコードを読み進めていくと、si_lf_eblkの意味がわかりました。
+     si_lf_eblkはファイルシステムに存在するファイルの中で、最後に書き込まれている（最もブロックの論理番号が大きい）もののEOFが書き込まれている
+     ブロックの論理番号が格納されています。
+     lfはLast Fileでしょうか。eblkはEndBLocKのことだと思われます。
+*** 47~53行目
+    コメントで"can we read the last block?"と言っています。簡単に訳すと、最後のブロックを読めるか？ということでしょう。
+    ブロックを読む関数としてsb_bread関数を使っています。sb_read関数の説明は7行目の解説の際行っているので、それを見ましょう。
+    とりあえず、info->si_blocksにはこのファイルシステムに含まれるブロックの数が格納されています。（43行目）
+    この値から1を引くと、このファイルシステムの最後のブロックの論理番号になることは理解していただけると思います。
+    おそらく、これは読み取ったスーパブロックの値が正しいかを確認するために行っていると考えられます。これより後の行を見ると、
+    sb_breadの結果が格納されたbh変数をifで判定しています。bhの値がNULLであった場合は、"Last block not available: ブロック数"
+    と表示します。そしてret変数にEIOエラーを代入し、out3ラベルにジャンプしています。
+    つまり、最後のブロックが正しく読めない->スーパブロックの情報が間違っていた。ということなのでしょう。
+*** 54行目
+    brelse(bh);とだけあります。大体予想はつくのですが、bh変数が保持しているデータを解放しています。一応詳しく解説します。
+**** brelse関数
+     buffer_head構造体はバッファキャッシュ（キャッシュの１つ）のメモリ領域を指しています。キャッシュなので、複数の場所
+     から参照されます。brelse関数が行うことはそのキャッシュの解放ではなく、buffer_head構造体のb_countというフィールド
+     を減らすことです。このフィールドはバッファキャッシュの参照カウンタを担っています。このカウンタを減らし、誰もそのバッファキャッシュ
+     を参照しなくなったら解放するということになります。C++のstd::shared_ptrのような感じです。とりあえず、メモリは無駄にできないので
+     （カーネルがメモリリークを起こしていたら話になりません）、必ずbrelseは呼び出すようにしましょう。
+*** 55行目
+    bh変数にNULLを代入しています。エラーチェックのために確保したものなので、もう必要ありません。
+*** 56行目からのforループ
+    forの部分を0行目として話をしていきます。
+**** ループする目的
+     inodeが破壊されていないかエラーチェックを行っていきます。
+**** forループの範囲
+     最初のinode番号 ~ 最後のinode番号
+**** 1~4行目
+     1行目はbfs_inode構造体へのポインタ型変数を宣言しています。
+     2,3行目では何やら計算を行っています。
+     block変数には、inode番号が格納されている変数iから、先頭のinode番号を引いたものをBFS_INODES_PER_BLOCKで割り、
+     それに1を足した値を格納しています。BFS_INODES_PER_BLOCKは1ブロック当たりに含まれるinodeの数を表しています。
+     include/uapi/linux/bfs_fs.hには、BFS_INODES_PER_BLOCKは8として宣言されています。
+     つまり、(i - BFS_ROOT_INO)で、inode番号から、先頭から何番目のinodeか計算します。
+     それをBFS_INODES_PER_BLOCKで割り、1を足すとと、そのinodeがどのブロックに書き込まれているかわかります。
+     その値をblock変数に代入しているわけですね。
+     3行目のoff変数にはどうやら、目的のinodeはそのinodeが書き込まれているブロックの先頭のinodeから数えて何個目のinodeかの値
+     を格納しているようです。では、それを前提に計算式を見ていきましょう。
+     2行目と同様に(i - BFS_ROOT_INO)で、inode番号から、先頭から何番目のinodeか計算します。
+     その値をBFS_INODES_PER_BLOCKで剰余を取ります。これによって目的の値が得られるわけですね。
+     4行目はunsigned long型でeblock変数を宣言しているだけです。
+**** 5~8行目
+     if(!off)ですが、offが0のとき、bhを解放し、bhに新しくバッファキャッシュを確保したメモリ領域へのポインタを代入しています。
+     これは、ループをしていくなかで、これからエラーチェックをしていくinodeがブロックの先頭に書き込まれていた場合、
+     そのinodeが書き込まれているブロックはまだバッファキャッシュにキャッシュされていないので、そのような操作をするわけです。
+**** 9~10行目
+     if(!bh)は、bhがNULLであった場合は、ループを先頭に戻す処理を行います。
+     bhがNULLだと考えられるのは、5~8行目のバッファキャッシュ確保で失敗しているときになります。
+**** 11行目
+     bh->b_dataはバッファキャッシュされたブロックのデータへのポインタで、それにoffを足して、ちょうど目的のinode
+     が書き込まれているメモリ領域へのポインタにし、その値をbfs_inode構造体へのポインタに キャストして、
+     ループ開始時に宣言していおいたdi変数に代入しています。
+     ディスクにはbfs_inode構造体のデータがそのまま書き込まれているため、ポインタをキャストするだけでうまく行くわけです。
+**** 12行目
+     コメントで/* test if filesystem is not corrupted */と書かれており、適当に日本語に訳すと、
+     ファイルシステムが破壊されていないか、テストします。といったところです。これでこれより後のプログラムは
+     ファイルシステムの破壊を検証するものだということになります。
+**** 13~16行目
+     各種値をこの関数の先頭で宣言していた変数に格納していきます。
+     これを理解するには、BFSが利用するbfs_inode構造体の仕様についての知識が必要となります。
+     以下に仕様書の記述を筆者が日本語訳したものを書いておきます。注意が必要なのは、仕様書と実装されているものとの間には差異があるということです。
+     | 型          | 名称          | 実装上のフィールド名 | 説明                                                              |   |
+     | 32bit整数   | inode number  | i_ino                | inode番号。たまに上位16bitにはゴミが入ります。                    |   |
+     | 32bit整数   | first block   | i_sblock             | ファイルが書き込まれている最初のブロック。n, n+1, n+2と続きます。 |   |
+     | 32bit整数   | last block    | i_eblock             | ファイルが書き込まれている最後のブロック。                        |   |
+     | 32bit整数   | offset to eof | i_eoffset            | EOFまでのディスクオフセット。単位はバイト                         |   |
+     | 32bit整数   | Attributes    | i_vtype              | ファイルの属性。(1->通常ファイル, 2->ディレクトリ)                |   |
+     | 32bit整数   | mode          | i_mode               | ファイルのモード。rwxrwxrwxを表す。下位9bitしか使わない。         |   |
+     | 32bit整数   | uid           | i_uid                | ファイルの所有者 - ユーザID                                       |   |
+     | 32bit整数   | git           | i_gid                | ファイルの所有グループ - グループID                               |   |
+     | 32bit整数   | nlinks        | i_nlink              | ハードリンクされている数                                          |   |
+     | 32bit整数   | atime         | i_atime              | アクセスした日時                                                  |   |
+     | 32bit整数   | mtime         | i_mtime              | 編集した日時                                                      |   |
+     | 32bit整数   | ctime         | i_ctime              | 作成日時                                                          |   |
+     | 4*32bit整数 | spare         | i_padding            | 予備。使っていない領域。ここはゼロクリアされているべき。          |   |
+     では、13~16行目の説明を書いていきます。
+***** 13行目
+      i_eoffにはinodeが指すファイルのEOFまでのディスクオフセットをバイトで格納。
+***** 14行目
+      i_sblockにはinodeが指すファイルが書き込まれている最初のブロックの論理番号が格納されます。
+***** 15行目
+      i_eblockにはinodeが指すファイルが書き込まれている最後のブロックの論理番号が格納されます。
+***** 16行目
+      s_sizeにはファイルシステムのサイズを表すbfs_sb->s_endを代入している。
+**** 17~21行目
+     ファイルシステムが破損していないか確認する条件式が5個(厳密に言えば6個)列挙されています。
+***** 1つ目
+      i_sblock > info->si_blocks
+      これはinodeが指すファイルの開始位置がこのファイルシステムのブロック数よりも大きい場合、破損としています。
+      まあそうでしょう。
+***** 2つ目
+      i_eblock > info->si_blocks
+      これはinodeが指すファイルの終了地点がこのファイルシステムのブロック数よりも大きい場合、破損としています。
+      まあそうでしょう。
+***** 3つ目
+      i_sblock > i_eblock
+      これはinodeが指すファイルの開始地点が同じinodeが指すファイルの終了地点よりも大きかった場合、破損としています。
+      まあそうでしょう。
+***** 4つ目
+      (i_eoff != le32_to_cpu(-1) && i_eoff > s_size)
+      このinodeが指すファイルのEOFまでのディスクオフセットが-1ではない
+      かつ
+      このinodeが指すファイルのEOFまでのディスクオフセットがこのファイルシステムのサイズよりも大きい
+      場合、破損としています。
+      最初に-1では無いことを確認しているのは、未使用を表すときに-1を使用することを見越しているからでしょうか。
+      真の理由はわかりませんが、そんなところでしょう。とりあえず、破損扱いにする理由はわかります。
+***** 5つ目
+      i_sblock * BFS_BSIZE > i_eoff
+      i_sblock * BFS_BSIZEはinodeが指しているファイルの開始位置のバイトオフセットとなります。そのバイトオフセットが
+      同じinodeが指すファイルのEOFまでのバイトオフセットよりも大きい場合、破損としています。
+      まあそうでしょう。
+**** 22~25行目
+     17~21行目の条件式で破損と判断された場合、この処理を行う必要があります。
+     行う処理としては、破損していると判断するに至ったinode番号を8桁の16進数で出力します。
+     その後、inodeを読み取った元のバッファキャッシュを解放し、ret変数にEIOエラーコードを代入しout3ラベルにジャンプします。
+**** 26~29行目
+     inodeのinode番号が0場合、ファイルシステムのフリーなinodeの数を格納しておくinfo->si_freeiをインクリメントします。
+     その後、ループ先頭へと戻ります。ですが、ここで筆者は”はあ？”と思いました。inode番号は2以上なはずなので、こんな条件用意しても
+     絶対引っかからないじゃないかと思ったわけです。
+***** どこで未使用判定を行うのか
+      ifブロックの内部の処理的に、inodeが未使用かどうかを判定している雰囲気です。よくよく考え直してみると、どこでinodeの未使用判定を
+      行っているのかわかりません。仕様が書いてあるサイトを読んでも、未使用判定については記述がありません。さてどうしたものかと思い、
+      bfs_evict_inode関数に着目してみました。evictがこの関数を表しているのでしょうが、筆者の貧弱な英語能力では理解できないので、
+      Google翻訳にかけてみると、追い払う、取り除くという意味でした。removeと似た感じですね。
+      つまり、この関数を読み解けば、どこかでinodeを未使用状態にする処理があるので、それを確認します。
+      （bfs_evict_inode関数についてはあとで詳しく解説します。）
+      bfs_evict_inode関数の中にmemset(di, 0, sizeof(struct bfs_inode));という処理があります。
+      diはbfs_inode構造体へのポインタです。つまり、inodeの領域を0で埋めています。つまり、すべてのフィールドは
+      0にセットされるわけです。つまり、未使用状態のinodeはすべて0であるということになります。
+      話を戻すと、未使用状態のinodeを読み込むとinode番号は0にセットされています。なので、inode番号を確認して0ならば、未使用なりの
+      処理を行うというプログラムになっているわけです。
+**** 30行目
+     set_bit関数を使って使用済みフラグをinodeの仕様状況をビットマップで表したinfo->si_imapに立てています。
+     通常、この関数においては、si_imapは先頭2bitを覗いてゼロクリアされています。なので、未使用な場合はここのコードに
+     到達しないので、未使用を表す0のままというわけです。
+**** 31行目
+     info->si_freebはこのファイルシステムのデータ領域におけるフリーなブロックの数が格納されています。
+     その値をBFS_FILEBLOCKSというマクロで得られた値分引いています。マクロ名からなんとなく、したいことが伝わってきます、
+***** BFS_FILEBLOCKSマクロ
+#+BEGIN_SRC c
+#define BFS_FILEBLOCKS(ip) \
+        ((ip)->i_sblock == 0 ? 0 : (le32_to_cpu((ip)->i_eblock) + 1) -  le32_to_cpu((ip)->i_sblock))
+#+END_SRC
+       では、このマクロについて説明を行っていきます。
+       このマクロの定義上、引数に受け取る値の型はbfs_inode構造体へのポインタを想定して書かれています。
+       もし、i_sblockつまり、inodeの指すファイルの開始地点のブロックの論理番号が0だった場合は、0を返します。（そんなことあるのでしょうか）
+       それ以外の場合は、終了地点のブロックの論理番号+1から開始地点のブロックの論理番号を引いたものを返すように指定ます。
+       これで、ファイルが何ブロックに渡って書き込まれているのかが計算できます。
+       話を戻すと、これによってフリーなブロック数のデータを使用済みのブロック分減らすことができるわけです。
+**** 32行目
+     eblock変数にdiのi_eblockフィールドの値を代入しています。
+**** 33~34行目
+     eblock > info->si_lf_eblk
+     という条件式でifブロックが構成されています。
+     info->si_lf_eblkについてですが、このフィールドには、si_lf_eblkはファイルシステムに存在するファイルの中で、
+     最後に書き込まれている（最もブロックの論理番号が大きい）もののEOFが書き込まれているブロックの論理番号が格納される仕様になっています。（ソースコードを読んでいて気づきました）
+     この時点では、最後のファイルを指すinodeを探している途中なので、使用済みのinodeを見つけるごとに、検証を行い、
+     eblock > info->si_lf_eblkという条件式を満たしていれば、info->si_lf_eblkの値をeblockに更新しています。
+     ループが終了すれば、info->si_lf_eblk変数には目的の値が格納されていることでしょう。
+
+       
+*** ループ終了後の4行
+**** 1~2行目
+    bfs_fill_super関数が行うべきスーパブロックの読み取り、エラーチェックは完了したので、解放する必要がある
+    bhとsbhを解放しています。
+**** 3行目
+     bfs_dump_imap関数を呼び出しています。この関数については、デバッグ手法の章で説明します。
+     簡単に説明すると、bfs_super_block構造体のsi_imapフィールドのビット配列を文字列に変換して、出力するという処理です。
+**** 4行目
+     正常終了を伝えるため、0を返しています。
+     これにてbfs_fill_super関数の処理は終了となります。
+    
+*** out3ラベル
+    ルートディレクトリのディレクトリエントリが格納されたs->s_rootフィールドをdput関数に渡しています。
+    dput関数はdentry構造体を解放する関数です。ソースの解説は本題から外れそうなので、関数上部のコメントを読むことにします。
+/*
+ * dput - release a dentry
+ * @dentry: dentry to release 
+ *
+ * Release a dentry. This will drop the usage count and if appropriate
+ * call the dentry unlink method as well as removing it from the queues and
+ * releasing its resources. If the parent dentries were scheduled for release
+ * they too may now get deleted.
+ */
+/*
+ * dput - dentryを解放する。
+ * @dentry: 解放するdentry。 
+ *
+ * dentryを解放する。これにより、参照カウントが減らされ、カウントに応じてdentry_unlinkメソッドを呼び出し、解放する。
+ * 親のディレクトリエントリが解放される場合にも解放される可能性がある。
+ */
+    とりあえず、この関数はdentryの参照カウンタを減らすものだとわかりました。buffer_headのbrelseと同じですね。
+    解放をした後は。s->s_rootにNULLを代入してout2ラベルに到達します。
+*** out2ラベル
+    inodeの使用状況をビットマップで表現したinfo->si_imapをkfreeを使って解放します。
+    その後はout1ラベルに到達します。
+*** out1ラベル
+    buffer_head構造体へのポインタであるsbh変数をbrelse関数で解放します。
+    その後はoutラベルに到達します。
+*** outラベル
+    info->bfs_lockも必要ないので、mutex_destroy(&info->bfs_lock);でミューテックスを破棄します。
+    その後はinfoをkfreeで解放します。
+    スーパブロック構造体へのポインタであるsのフィールドであるs_fs_infoにはinfoが入っていました。これにNULLを格納しておきます。
+    最終的に、エラーコードが格納されているであろうretを返却します。
+    
+* inode操作
+** find_inode関数
+   この関数はその名前の通り、ディスク上から、指定したinode番号のinodeを取得する関数です。
+*** 引数
+**** 第一引数
+     struct super_block *sb
+     このファイルシステムのスーパブロックを表すsuper_block構造体へのポインタです。
+     super_block構造体はVFSから提供されます。
+**** 第二引数
+     u16 ino
+     探すinode番号です。
+**** 第三引数
+     struct buffer_head **p
+     バッファキャッシュを表すbuffer_head構造体を指すポインタのポインタです。
+*** 1~3行目
+    (ino < BFS_ROOT_INO) || (ino > BFS_SB(sb)->si_lasti)
+    このどちらか二つの条件式が真の場合、エラー出力としてファイルシステムの名前が格納されているsb->s_idとinode番号を出力します。
+    その後、エラーコードとしてEIOを返します。
+    では、条件式について見ていきましょう。
+    inode番号がBFS_ROOT_INOより小さい、
+    または
+    inode番号が最大のinode番号より大きい場合
+    エラーコードを出力を行います。
+    ちなみに、si_lastiにはこのファイルシステムが取り得る最大のinode番号が格納されています。
+**** BFS_SB関数
+     BFS_SB関数は以下のように定義されています。
+#+BEGIN_SRC c
+/////
+// fs/bfs/bfs.h BFS_SB関数
+/////
+static inline struct bfs_sb_info *BFS_SB(struct super_block *sb)
+{
+        return sb->s_fs_info;
+}
+#+END_SRC
+      渡されたsuper_block構造体からbfs_sb_infoへのポインタであるs_fs_infoフィールドを返却しています。
+      つまり、super_block構造体からbfs_sb_infoを取り出す関数ということになります。
+*** 4行目
+    inode番号が不正なものでは無いと確認した後は、inoからBFS_ROOT_INOだけ減算しています。これはinode番号を0ベースのものに直している処理です。
+    BFSのinode番号はファイルシステムの伝統的に2ベースで定義されています。ブロックを読むときは0ベースに直す必要があります。
+*** 5行目
+    sb_bread関数を使い、ブロックを読み出します。この時、1 + ino / BFS_INODES_PER_BLOCKという演算を行っています。
+    これについて少し解説します。
+    最初の1は、inode領域が0ブロック目からではなく、1ブロック目から始まっているからです。
+    ino / BFS_INODES_PER_BLOCKはinode番号を1ブロック当たりに格納できるinodeの数で割るという意味です。
+    これに1を足すことで、要求されたinode番号のinodeが書き込まれたディスクブロックの論理番号が計算できるというわけですね。
+    sb_breadで取得したbuffer_head構造体は引数で受け取っていたpを参照して格納します。
+*** 6~9行目
+    sb_breadが失敗していた場合、pが指す実体にはNULLが格納されます。もしも、失敗していた場合は、2行目と同じ情報を出力して、
+    エラーを知らせます。表示する数値は2行目と同じですが、メッセージは少し違います。2行目はinode番号が不正であることを表示しますが、
+    今回は、inodeの読み込みができなかったことを表示しています。
+    エラーを出力した後は、EIOエラーコードを返します。
+*** 10行目
+    (struct bfs_inode *)(*p)->b_data + ino % BFS_INODES_PER_BLOCKを返しています。
+    この計算式を見ていきましょう。
+    まず、p->b_dataはsb_breadでメモリにキャッシュされたメモリ領域のへのポインタです。
+    これをbfs_inode構造体へのポインタにキャストします。
+    演算子の優先順位的に、+-よりも%の方が先に演算されますので、ino % BFS_INODES_PER_BLOCKが先に行われます。
+    この演算で、目的のinodeはブロックの先頭のinodeから何番目のinodeかがわかります。
+    この値を上のポインタに加算します。ここで注意が必要なのは、ポインタの加算についてです。
+    次の例では、0x00から0x10に変化します。
+    int *p = 0;
+    p += 4;
+    これはintのサイズが4バイトなので、4足すということは、4ポインタをすすめるということになり、4*4、つまり16だけ加算されたことになるのです。
+    今回の例では、struct bfs_inodeなので、それだけ、ポインタが前に進みます。その値を返すことになります。
+    この値は、目標のinodeへのポインタとなっています。
+** bfs_alloc_inode関数
+*** 概要
+    super_block構造体へのポインタを受け取り、inode構造体へのポインタを返す関数です。関数の名前的に、inode構造体を確保して、そのポインタを
+    返すような関数っぽいです。
+*** 引数
+    struct super_block *sb
+    inodeを読み取るファイルシステムのスーパブロックを表すsuper_block構造体をへのポインタ。
+*** 返り値
+    struct inode *
+    確保したinode構造体へのポインタ。
+*** 1行目
+    bfs_inode_info構造体へのポインタ変数であるbiを宣言しています。
+*** 2行目
+    bfs_inode_info分のメモリをキャシュから確保しています。このキャッシュはグローバル変数として定義されているbfs_inode_cachepです。
+    kmem_cache_alloc関数は初登場だった気がするので、軽く解説しておきます。
+#+BEGIN_SRC c
+/////
+// mm/slab.c kmem_cache_alloc関数
+/////
+/**
+ * kmem_cache_alloc - Allocate an object
+ * @cachep: The cache to allocate from.
+ * @flags: See kmalloc().
+ *
+ * Allocate an object from this cache.  The flags are only relevant
+ * if the cache has no available objects.
+ */
+void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+        void *ret = slab_alloc(cachep, flags, _RET_IP_);
+
+	      kasan_slab_alloc(cachep, ret, flags);
+	      trace_kmem_cache_alloc(_RET_IP_, ret,
+			       cachep->object_size, cachep->size, flags);
+
+	      return ret;
+}
+
+/////
+// mm/slab.c slab_alloc関数
+/////
+static __always_inline void *
+slab_alloc(struct kmem_cache *cachep, gfp_t flags, unsigned long caller)
+{
+        unsigned long save_flags;
+	      void *objp;
+
+	      flags &= gfp_allowed_mask;
+	      cachep = slab_pre_alloc_hook(cachep, flags);
+	      if (unlikely(!cachep))
+                return NULL;
+
+        cache_alloc_debugcheck_before(cachep, flags);
+	      local_irq_save(save_flags);
+	      objp = __do_cache_alloc(cachep, flags);
+	      local_irq_restore(save_flags);
+	      objp = cache_alloc_debugcheck_after(cachep, flags, objp, caller);
+	      prefetchw(objp);
+
+	      if (unlikely(flags & __GFP_ZERO) && objp)
+		            memset(objp, 0, cachep->object_size);
+
+	      slab_post_alloc_hook(cachep, flags, 1, &objp);
+	      return objp;
+}
+#+END_SRC
+    コメントを読むと、キャッシュからオブジェクトを確保する関数のようです。ここで、確保したメモリ領域へのポインタは
+    1行目で宣言されているbi変数に格納されます。
+*** 3~4行目
+    kmem_cache_allocが失敗しているかどうかを判定しています。kmem_cache_alloc内でメモリ確保に使われている
+    slab_alloc関数のソースコードを見ると、失敗した場合、NULLが返るようになっています。
+    なので、kmem_cache_allocも失敗したときはNULLが買えるので、ifで簡単に判定できるというわけです。
+    メモリの確保に失敗した場合はNULLを返すようになっています。
+*** 5行目
+    bfs_inode_info構造体のvfs_inodeフィールドはinode構造体であるため、そのポインタを返している。
+    （ここで、bfs_inode_info構造体分確保するのではなく、inode構造体のみ確保したほうがメモリ効率が良いと思うのですが、どうなんでしょう。）
+** bfs_destroy_inode関数
+*** 概要
+    inode構造体へのポインタを受け取り、それを解放することが目的なようです。返り値は存在せず、ただ単に解放するだけです。
+*** 引数
+    struct inode *inode
+    解放したいinode構造体
+*** 返り値
+    なし
+*** 1行目
+    call_rcu関数にinode構造体のi_rcuフィールドと、bfs_i_callback関数へのポインタを渡しています。
+    call_rcuに関しては、RCUの説明のときに触りだけしたと思いますが、それだけだと、引数の意味の理解が不十分なので、
+    ソースコードをチラチラ見ていくことにしましょう。上述のcall_rcu関数の説明と同じ文をここにもおいておきます。
+    ###
+    call_rcu関数は、すべてのCPUで古いデータが参照されていないことを確認したあと、
+    引数で受け取ったコールバック関数をを呼び出しすべての古いデータを削除することになります。
+    ###
+#+BEGIN_SRC c
+/////
+// include/linux/rcupdate.h call_rcu
+/////
+#define	call_rcu	call_rcu_sched
+
+/////
+// kernel/rcu/tiny.c call_rcu_sched関数
+/////
+/*
+ * Post an RCU callback to be invoked after the end of an RCU-sched grace
+ * period.  But since we have but one CPU, that would be after any
+ * quiescent state.
+ */
+void call_rcu_sched(struct rcu_head *head, rcu_callback_t func)
+{
+         __call_rcu(head, func, &rcu_sched_ctrlblk);
+}
+
+/////
+// kernel/rcu/tiny.c __call_rc関数
+/////
+/*
+ * Helper function for call_rcu() and call_rcu_bh().
+ */
+static void __call_rcu(struct rcu_head *head,
+		       rcu_callback_t func,
+		       struct rcu_ctrlblk *rcp)
+{
+        unsigned long flags;
+
+	      debug_rcu_head_queue(head);
+	      head->func = func;
+	      head->next = NULL;
+
+	      local_irq_save(flags);
+	      *rcp->curtail = head;
+	      rcp->curtail = &head->next;
+	      local_irq_restore(flags);
+
+	      if (unlikely(is_idle_task(current))) {
+		            /* force scheduling for rcu_sched_qs() */
+		            resched_cpu(0);
+	      }
+}
+#+END_SRC
+    とまあこんな感じです。call_rcuはcall_rcu_schedにマクロされており、call_rcu_schedはすぐに__call_rcuを呼び出しています。
+    ここで、__call_rcuに渡す引数は、すでにもらっていた二つに加え、&rcu_sched_ctrlblkを渡しています。この変数は、kernel/rcu/tiny.c
+    内で定義されている、静的グローバル変数です。__call_rcuではfuncはheadのfuncフィールドに代入されています。この関数の処理的に、
+    すべての読み手がいなくなった時に呼ばれるのでしょう。こうして、inode構造体のメモリ領域を参照する者がいなくなった時に解放されます。
+*** bfs_i_callback関数
+**** 概要
+    bfs_i_callback関数は、上で書かれているとおり、inode構造体を解放するための関数です。解放する流れとして、直接解放を行うわけではありません。
+    LinuxではRCUという同期手法を用いているため、その流れで領域の解放を行います。（RCUについてはどこかで解説していたはずです。）
+    なので、bfs_i_callback関数の引数はinode構造体へのポインタではなく、rcu_head構造体へのポインタとなります。
+    rcu_head構造体はデータが格納されているメモリ領域を管理しています。
+**** 1行目
+     container_ofというマクロを使ってどこからともなくinode構造体へのポインタを作り出してます。
+     どうやっているのでしょうか。それを理解するためにソースコードを読んでみることにしましょう。
+#+BEGIN_SRC c
+/////
+// include/linux/kernel.h container_ofマクロ
+/////
+/**
+ * container_of - cast a member of a structure out to the containing structure
+ * @ptr:	the pointer to the member.
+ * @type:	the type of the container struct this is embedded in.
+ * @member:	the name of the member within the struct.
+ *
+ */
+#define container_of(ptr, type, member) ({				\
+        void *__mptr = (void *)(ptr);					\
+	      BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) &&	\
+			          !__same_type(*(ptr), void),			\
+			          "pointer type mismatch in container_of()");	\
+	      ((type *)(__mptr - offsetof(type, member))); })
+#+END_SRC
+      定義の一行目はマクロ名と引数だけです。
+      2行目ではvoidポインタ型の変数を宣言し、引数であるptrを代入しています。ptrはbfs_i_callback関数の引数であるheadです。
+      3~5行目はとりあえず飛ばします。
+      6行目では__mptrから、type型のmemberのオフセットを引き、type型へのポインタにキャストしています。今回使用している例だと、
+      inode構造体のi_rcuフィールドのオフセットを、headから引き、それをinode構造体へのポインタにキャストすることになります。
+      これだけを聞くと、
+      ”はあ？意味不明なポインタ作り出して、それをinode構造体へのポインタにキャストしても、狂ったポインタになるだけじゃん。”
+      と思うでしょう。筆者はこの疑問にぶつかって半日ほど悩んでいました。
+      ここで重要なことは、引数のrcu_head構造体へのポインタであるheadはどこを指しているかです。これに気づけばとても明快な
+      処理です。（container_ofマクロの上部のコメントを読めば、なんとなくわかります。）
+      今回のheadはinode構造体のフィールドであるi_rcuを指しています。なので、i_rcuへのポインタから、inode構造体のi_rcu
+      までのオフセットを引けば、inode構造体の先頭へのポインタになるわけです。
+      すなわち、bfs_i_callback関数の目的であるinode構造体の解放の対象であるinode構造体をrcu_headから持ってくることができるわけです。
+      このような処理をすることでRCUの実現の一端を担っているわけです。(rcu_callで呼び出されるコールバック関数であるから、特定の構造体に対して、特殊化するのはナンセンス)
+      (改めて見ると、このマクロは結構頭がいいです。)
+*** 2行目
+    kmem_cache_free関数を使ってbfs_inode_cachepから確保したinodeを解放しています。
+** bfs_write_inode関数
+*** 概要
+    編集済みのinode構造体へのポインタを受け取り、それを元にbfs_inode構造体を作り出し、ディスクに書き込む。
+*** 1~6行目
+    様々な変数をここで宣言しています。ここで着目すべき変数は、bfs_sb_info構造体へのポインタのinfo変数と、符号なし32bit整数のino変数です。
+    info変数には、引数で受け取ったinode構造体へのポインタを参照して、i_sbフィールドを取り出し、その値をbfs_sb_info構造体のポインタ
+    にキャストして渡しています。このときのi_sbフィールドには、属しているinode構造体が書き込まれているファイルシステムのスーパブロックを表す、
+    super_block構造体へのポインタが格納されています。
+    ino変数にはinode構造体へのポインタを参照して、i_inoフィールドを代入しています。これはinode番号を表しています。
+*** 7行目
+    dprintfは#defineでprintfに置き換えられ、bfsでは、fs/bfs/bfs.hにかかれているとおり、またもや#defineでprintkに置き換えられます。
+    デバッグとしてinode番号を出力しているようです。
+*** 8行目
+    上で説明を行っているfind_inode関数でbfs_inode構造体へのポインタをsuper_block構造体へのポインタと、inode番号、buffer_head構造体へのポインタ
+    で取得しています。それをbfs_inode構造体へのポインタ型の変数であるdiに代入しています。
+*** 9~10行目
+    上で説明を行っているIS_ERRマクロを使って、取得したdi変数にエラーコードが格納されていないかチェックしています。
+    エラーだった場合、diに格納されていたエラーコードをそのまま返しています。
+*** 11行目
+    inodeの更新処理は排他的に処理を行う必要があります。inode情報書き換え中にプロセスが切り替わり、同じinodeを操作しようとするプロセスが存在していて、
+    情報をさらに書き換えてしまう可能性があるからです。なので、mutex_unlockが呼ばれるまで、inode情報書き込みの処理はミューテックスで排他処理にしています。
+*** 12~15行目
+    inode番号がBFS_ROOT_INO(ルートディレクトリのinode番号)だった場合、inode構造体のi_vtypeにBFS_VDIRを代入しています。
+    それ以外はBFS_VREG代入しています。
+    i_vtypeはinodeが指すファイルの属性を示すメンバで、1はファイル、2はディレクトリとなります。
+    ここで、BFS_VDIRとBFS_VREGの定義を見てみます.
+#+BEGIN_SRC c
+/* SVR4 vnode type values (bfs_inode->i_vtype) */
+#define BFS_VDIR 2L
+#define BFS_VREG 1L
+#+END_SRC
+    BFSでは、ディレクトリはルートディレクトリのみなので、inode番号がルートディレクトリだった場合は、属性をディレクトリに設定し、
+    それ以外の場合はファイルの属性を表す１を格納しているというわけです。
+*** 16~27行目
+    ここでは、排他状態で、bfs_inode構造体に値を代入していきます。１つずつ説明していきます。
+    ==
+    di->i_ino = cpu_to_le16(ino);
+    inode番号を設定しています。引数として受け取ったinoを使用しています。
+    ==
+	  di->i_mode = cpu_to_le32(inode->i_mode);
+    ファイルのモード、rwxrwxrwxを示す9bitデータを含む値を代入します。引数として受け取ったinode構造体からコピーしています。
+    ==
+	  di->i_uid = cpu_to_le32(i_uid_read(inode));
+    ファイルの作成者のユーザIDをコピーしています。i_uid_read関数についてですが、回り回って今回の場合はinode構造体のi_uidメンバが返ってきます。
+    ==
+	  di->i_gid = cpu_to_le32(i_gid_read(inode));
+    ファイルの作成グループIDをコピーしています。i_gid_read関数もi_uid_read関数と同様、結局inode構造体のi_gitメンバが返ってきます。
+    ==
+	  di->i_nlink = cpu_to_le32(inode->i_nlink);
+    inodeが指すファイルのハードリンクされている数をコピーしています。引数として受け取ったinode構造体からコピーしています。
+    ==
+	  di->i_atime = cpu_to_le32(inode->i_atime.tv_sec);
+    inodeが指すファイルの最終アクセス日時をUNIX時間の通算秒で受け取っているようです。ここで注意が必要なのは、inode構造体の
+    i_atimeはtimespec構造体を利用していますが、bfs_inodeのi_atimeは32bit整数の型となっているので、直接受け渡すことはできない
+    ということです。なので、今回はUNIX時間の通算秒であるinode->i_atime.tv_secを代入しています。
+    ==
+	  di->i_mtime = cpu_to_le32(inode->i_mtime.tv_sec);
+    inodeが指すファイルの最終編集時間をUNIX時間の通算秒で受け取っています。これもinode構造体のi_atimeと同様で、
+    直接i_mtimeをコピーするわけではありません。
+    ==
+	  di->i_ctime = cpu_to_le32(inode->i_ctime.tv_sec);
+    inodeが指すファイルの作成日時をコピーしています。上の最終アクセス時間、最終編集時間と同様です。
+    ==
+    i_sblock = BFS_I(inode)->i_sblock;
+    次行以降の処理を見る限り、bfs_inode_infoのメンバであるi_sblockはinodeが指すファイルの開始ブロックの論理番号
+    を表しているようです。今後、i_sbblockはいろいろと使うので変数に一度格納しているだけです。こういうinode構造体に格納できない
+    メタ的な情報をbfs_inode_info構造体に格納しておくわけですね。それをBFS_I関数で、メンバから、所属している構造体を得てます。
+    実は、BFS_I関数には筆者が半日も悩まされたcontainer_ofマクロがあります。意味さえわかってしまえば、理解することはらくちんなマクロです。
+    ==
+	  di->i_sblock = cpu_to_le32(i_sblock);
+    inodeが指すファイルが書き込まれているディスクの開始地点のブロックの論理番号をbfs_inode構造体のi_sblockに代入しています。
+    ==
+	  di->i_eblock = cpu_to_le32(BFS_I(inode)->i_eblock);
+    inodeが指しているファイルの終点地点が書き込まれているディスクのブロックの論理番号をbfs_inode構造体のi_eblockに代入しています。
+    ==
+	  di->i_eoffset = cpu_to_le32(i_sblock * BFS_BSIZE + inode->i_size - 1);
+    i_sblockとBFS_BSIZE(ブロック１つ当たりのバイトサイズ)をかけることで、ファイルの開始地点のディスクバイトオフセットが計算できます。
+    そして、それにinode->i_sizeを足しています。これは指しているファイルのサイズを表しているメンバです。これで、inodeが指すファイルの
+    終点地点のディスクバイトオフセットが計算できました。最後に1を引くことで、inodeが指すファイルのEOFまでのディスクバイトオフセットが
+    計算できたことになります。bfs_inode構造体のi_eoffsetはinodeが指すファイルのEOFまでのディスクバイトオフセットを格納しておくメンバ
+    なので、正しく処理できていることになります。
+    ==
+*** 28行目
+    mark_buffer_dirty関数は、指定されたバッファキャッシュに対して、dirtyをマークする関数です。
+    dirtyとは、バッファキャッシュの内容と、もともとディスクに書かれていた内容とで差異が生じているということです。
+    今回、mark_buffer_dirty関数にはbuffer_head構造体へのポインタであるbh変数が渡されいます。
+    bhはどこで値がセットされているかというと、find_inode関数です。find_inode関数の定義を見ると、このbhには
+    inodeデータがキャッシュされているバッファキャッシュを指すようになっています。
+    つまり、キャッシュされているinode情報を書き換えたので、ディスクの情報と異なっていますよというマークをbhにつけています。
+    バッファキャッシュをdirtyにすることで、カーネルが将来ディスクに書き込き込むことになります。
+*** 29行目
+    wbc->sync_mode == WB_SYNC_ALLの条件式を評価しています。
+    wbcはwriteback_control構造体へのポインタで、それを参照してsync_modeを取り出しています。その値がWB_SYNC_ALLだった場合、条件式が真になります。
+    ですが、writeback_control構造体とかsync_mode、WB_SYNC_ALLってなんぞやって感じです。
+**** WriteBack処理
+     プロセスがファイルへの書き込みを行うと、カーネルは通常はディスクキャッシュに書き込むだけで一旦処理を完了する。(ディスクヘの書き込みは行わない)
+     このデータが書き込まれたキャッシュは、ディスク上のデータと内容が不一致になっていることを示すためDirty状態になる。
+     Dirty状態のページキャッシュはカーネルスレッドpdflushによって、遅延してディスクに書き込まれる。この処理をWriteBack処理と呼ぶ。
+     http://wiki.bit-hive.com/linuxkernelmemo/pg/WriteBack%BD%E8%CD%FDより引用
+**** sync_mode
+#+BEGIN_SRC c
+enum writeback_sync_modes {
+        WB_SYNC_NONE,	/* Don't wait on anything */
+	      WB_SYNC_ALL,	/* Wait on every mapping */
+};
+#+END_SRC
+     writeback_control構造体のメンバであるsync_modeはwriteback_sync_modes列挙体となっており、この列挙体の定義は上のようです。
+     （writeback_controlの詳しい解説は飛ばします）
+     コメントを見ると、writeback構造体のsync_modeは列挙体によって以下のような状態になるようです。
+     | 列挙体       | 説明                             |
+     | WB_SYNC_NONE | 何も待たない。                   |
+     | WB_SYNC_ALL  | すべてマッピングされるまで待つ。 |
+     つまり、sync_modeがWB_SYNC_ALLだった場合は、マッピングが完了するまで待機する必要があるため、それに関する処理を行うべく
+     次の3行へと進んでいきます。逆にWB_SYNC_NONEはすぐにbrelseなどをして終了するようです。
+*** 30行目
+    sync_dirty_buffer関数を呼び出しています。sync_dirty_buffer関数については、ソースコード上部のコメント等を読んだのですが、
+    いまいち概要を把握できず、ソースコードを読んでみても、深く深く行くだけでよく意味がわかりませんでした。本来、ここでは、dirtyな状態
+    になったバッファを書き込む処理を発生させるため、wakeup_pdflush関数や、balance_dirty_pages_ratelimited関数を呼び出して、
+    WriteBack処理を実行するpdflushカーネルスレッドを起動させるような気がします（筆者は）。ですが、sync_dirty_buffer関数を
+    呼び出しています。ext2の実装を見ても、似たような場面でこの関数が呼び出されていました。なので、私の推測は少し的はずれなようです。
+    そこで、sync_dirty_buffer関数についていろいろ調べていると、簡潔に処理内容が記述されている文章を見つけました。
+    文章は詳解Linuxカーネル第3版に載っていました。ext2ファイルシステムの解説中にsync_dirty_buffer関数に関する記述を見つけました。
+    それをわかりやすく言うと、
+    sync_dirty_buffer関数:バッファに関する書き込み操作が終了するまで待つ。
+    ということです。すなわち、今回の場合はdirty状態になっているbhのinodeに対する書き込みが行われるまで待つということです。
+*** 31~32行目
+    buffer_req(bh) && !buffer_uptodate(bh)
+    この二つの条件式を評価し、真だった場合は、EIOエラーコードをerr変数に代入しています。
+**** buffer_req関数
+     この関数は本当に謎です。筆者が利用しているLinuxカーネルのソースコードを便利に閲覧できる、lxrを用いて提供されているfree electrons
+     でbuffer_req関数を検索しても引っかかりません。詳解Linuxカーネル第3版にも記載されているのかどうかよくわかりませんでした。
+     Googleでbuffer_reqと調べても情報がほとんど出てきませんでした。ですが、buffer_req linuxで検索するとなんとか次のページを発見しました。
+     https://osdn.net/projects/linux-kernel-docs/wiki/internal24-71-%E3%81%9D%E3%81%AE%E4%BB%96%E3%81%AE%E4%B8%BB%E3%81%AA%E3%83%90%E3%83%83%E3%83%95%E3%82%A1%E6%93%8D%E4%BD%9C%E9%96%A2%E6%95%B0%E7%BE%A4
+     Linuxカーネル解読室のページっぽいです。手元のこの本にbuffer_req関数の情報は載ってないと思ったんですがね。
+     とりあえず、buffer_req関数は「一度はバッファに対しI/Oが発行されたことがある。」かどうかの情報を返すようです。
+     なので、１つ目の条件式は、一度はバッファに対しI/Oが発行されたことがある、かつ２つ目の条件式ということになります・
+**** buffer_uptodate関数
+     これもよく分からない関数で、定義がどこに書いてあるのかわかりません。buffer_req関数の説明を発見したページに
+     buffer_uptodate関数の説明も書いてあったのでそれを参考にすると、buffer_uptodate関数の役割は次のようなものです。
+     「バッファの内容が有効であるかをチェック(そのバッファの内容を 利用可能かどうか？) バッファの入れ物だけで中身が不定のことがある。 」
+     とりあえず、これでやりたいことはわかりました。
+     バッファに対し一度はI/Oが呼ばれているが、その中身は無効なものだった場合、EIOエラーコードをerr変数に格納するということです。
+     buffer_uptodate関数を読み解くため、bh_state_bits列挙体や、その中の１つであるBH_Uptodateの使用場面などもいろいろと調べましたが、
+     イマイチ理解できませんでした。追記があるかもしれません。
+*** 33行目
+    すでに書き込み処理は終了したので、bhは解放します。writeback_control構造体のsync_modeがWB_SYNC_NONEだった場合で、まだ
+    書き込み処理が行われていない状態であっても、brelseの行うことは参照カウンタを減らすだけなので、その場合は問題ありません。
+*** 34行目
+    排他処理を行う区間を抜けたので、ミューテックスブロックを解除しています。
+*** 35行目
+    err変数を返却しています。何もエラー無く終了する場合は、初期値として格納しておいた0が返り、正常終了ということになります。
+    31行目のEIOエラーコード格納にたどり着いていた場合は。EIOエラーコードが返ることになります。
+     
+** bfs_evict_inode関数
+*** 概要
+    inode構造体へのポインタを受け取り、その構造体に紐付けられたinodeを除去する関数。
+*** 1~6行目
+    様々な変数をここで宣言しています。ここで着目すべき変数は、符号なし64bit整数型のino変数と、super_block構造体へのポインタであるs、
+    bfs_sb_info構造体へのポインタであるinfo、bfs_inode_info構造体へのポインタであるbiです。各種変数の説明を簡単に行います。
+    | 変数                      | 説明                                                                                                                                            |
+    | unsigned long ino         | 引数のinodeを参照してi_inoにアクセスし、inoに代入しています。i_inoにはinode番号が格納されています。                                             |
+    | struct super_block *s     | 引数のinodeを参照してi_sbにアクセスし、sに代入しています。i_sbにはそのinodeが属しているファイルシステムのスーパブロック情報が格納されています。 |
+    | struct bfs_sb_info        | super_block構造体のs_fs_infoを取り出す関数を用いて、各ファイルシステムごとのプライベート情報を取得し、info変数に代入しています。                |
+    | struct bfs_inode_info *bi | BFS_I関数を使って、引数のinodeが属しているbfs_inode_info構造体へのポインタを求め、bi変数に代入しています。                                      |
+*** 7行目
+    デバッグのために、inode番号を16進数で表示しています。
+*** 8行目
+    truncate_inode_pages_final関数にinode構造体のi_dataへのポインタを渡し実行しています。
+    truncate_inode_pages_final関数の動作について見ていきます。
+**** truncate_inode_pages_final関数
+     関数定義上部のコメントを見てみます
+#+BEGIN_SRC c
+/**
+ * truncate_inode_pages_final - truncate *all* pages before inode dies
+ * @mapping: mapping to truncate
+ *
+ * Called under (and serialized by) inode->i_mutex.
+ *
+ * Filesystems have to use this in the .evict_inode path to inform the
+ * VM that this is the final truncate and the inode is going away.
+ */
+##筆者による日本語訳
+/**
+ * truncate_inode_pages_final - inodeが死ぬ前にすべてのページを切り詰める
+ * @mapping: 切り詰めるマッピング
+ *
+ * inode->i_mutexによって排他状態になっている下で実行されなければなりません。
+ *
+ * ファイルシステムはこれをsuper_operationのevict_inodeで使用する。
+ * これが最後の切り詰めで、inodeが破棄されることをVMに通知します。
+ */
+#+END_SRC
+    これをある程度理解した上で、truncate_inode_pages_final関数と関連関数のソースコードを見てみます。
+#+BEGIN_SRC c
+/////
+// mm/truncate.c truncate_inode_pages_final関数
+/////
+void truncate_inode_pages_final(struct address_space *mapping)
+{
+	unsigned long nrexceptional;
+	unsigned long nrpages;
+
+	/*
+	 * Page reclaim can not participate in regular inode lifetime
+	 * management (can't call iput()) and thus can race with the
+	 * inode teardown.  Tell it when the address space is exiting,
+	 * so that it does not install eviction information after the
+	 * final truncate has begun.
+	 */
+	mapping_set_exiting(mapping);
+
+	/*
+	 * When reclaim installs eviction entries, it increases
+	 * nrexceptional first, then decreases nrpages.  Make sure we see
+	 * this in the right order or we might miss an entry.
+	 */
+	nrpages = mapping->nrpages;
+	smp_rmb();
+	nrexceptional = mapping->nrexceptional;
+
+	if (nrpages || nrexceptional) {
+		/*
+		 * As truncation uses a lockless tree lookup, cycle
+		 * the tree lock to make sure any ongoing tree
+		 * modification that does not see AS_EXITING is
+		 * completed before starting the final truncate.
+		 */
+		spin_lock_irq(&mapping->tree_lock);
+		spin_unlock_irq(&mapping->tree_lock);
+
+		truncate_inode_pages(mapping, 0);
+	}
+}
+
+/////
+// mm/truncate.c truncate_inode_pages関数
+/////
+/**
+ * truncate_inode_pages - truncate *all* the pages from an offset
+ * @mapping: mapping to truncate
+ * @lstart: offset from which to truncate
+ *
+ * Called under (and serialised by) inode->i_mutex.
+ *
+ * Note: When this function returns, there can be a page in the process of
+ * deletion (inside __delete_from_page_cache()) in the specified range.  Thus
+ * mapping->nrpages can be non-zero when this function returns even after
+ * truncation of the whole mapping.
+ */
+void truncate_inode_pages(struct address_space *mapping, loff_t lstart)
+{
+        truncate_inode_pages_range(mapping, lstart, (loff_t)-1);
+}
+
+/////
+// mm/truncate.c truncate_inode_pages_range関数 上部コメントにかかれている簡単な説明
+/////
+##truncate range of pages specified by start & end byte offsets
+->日本語訳
+##開始、終了バイトオフセットで指定された範囲のページを切り捨てる
+#+END_SRC
+    truncate_inode_pages_final関数内の、実際に切り詰め処理を行っているであろうtruncate_inode_pages関数を見てみます。
+    truncate_inode_pages関数には、inodeのマッピング領域へのポインタと、開始地点として0(領域の先頭を意味する)を渡しています。
+    そこには、truncate_inode_pages_range関数の呼び出し処理があります。引数には、inodeのマッピング領域へのポインタと、
+    開始地点として0、終了始点として-1を渡しています。truncate_inode_pages_range関数のソースコード（長いので載せません）
+    を見ると、このような記述があります。
+#+BEGIN_SRC c
+if (lend == -1)
+		/*
+		 * lend == -1 indicates end-of-file so we have to set 'end'
+		 * to the highest possible pgoff_t and since the type is
+		 * unsigned we're using -1.
+		 */
+		end = -1;
+else
+		end = (lend + 1) >> PAGE_SHIFT;
+#+END_SRC
+    ここでは、lendは引数の終了地点で、endはpgoff_t(unsigned long)型のローカル変数です。
+    lendが-1だった場合、全領域を切り詰める処理に変更するため、終了地点を-1(符号なしだとその整数値の最大を取る)
+    にし、全領域を切り詰める処理にしているようです。
+    つまり、truncate_inode_pages_finalで渡したinode領域はすべて切り詰められ、無かったことになります。
+*** 9行目
+    invalidate_inode_buffers関数を呼び出しています。関数名から察するに、inode情報が格納されたバッファを無効化するのでしょう。
+    一応関数定義上部のコメントを見てみることにします。
+#+BEGIN_SRC c
+/*
+ * Invalidate any and all dirty buffers on a given inode.  We are
+ * probably unmounting the fs, but that doesn't mean we have already
+ * done a sync().  Just drop the buffers from the inode list.
+ *
+ * NOTE: we take the inode's blockdev's mapping's private_lock.  Which
+ * assumes that all the buffers are against the blockdev.  Not true
+ * for reiserfs.
+ */
+## 筆者による日本語訳(NOTEの部分はGoogle翻訳)
+/*
+ * 渡されたinodeに置けるすべてのdirty状態のバッファを無効化します。
+ * 私達はおそらくファイルシステムをアンマウントしていますが、それはsync関数をすでに呼び出したというわけではありません。
+ *
+ * NOTE: 私たちはinodeのblockdevのマッピングのprivate_lockをとります。
+ * これは、すべてのバッファがblockdevに対抗していると仮定します。
+ */
+#+END_SRC
+    とりあえず、渡したinode領域を無効化する関数だと思ってください。
+*** 10行目
+    clear_inode関数を呼び出しています。
+#+BEGIN_SRC c
+/////
+// fs/inode.c clear_inode関数
+/////
+void clear_inode(struct inode *inode)
+{
+        might_sleep();
+	      /*
+	      * We have to cycle tree_lock here because reclaim can be still in the
+	      * process of removing the last page (in __delete_from_page_cache())
+	      * and we must not free mapping under it.
+	      */
+	      spin_locqk_irq(&inode->i_data.tree_lock);
+	      BUG_ON(inode->i_data.nrpages);
+	      BUG_ON(inode->i_data.nrexceptional);
+	      spin_unlock_irq(&inode->i_data.tree_lock);
+	      BUG_ON(!list_empty(&inode->i_data.private_list));
+	      BUG_ON(!(inode->i_state & I_FREEING));
+	      BUG_ON(inode->i_state & I_CLEAR);
+	      BUG_ON(!list_empty(&inode->i_wb_list));
+	      /* don't need i_lock here, no concurrent mods to i_state */
+	      inode->i_state = I_FREEING | I_CLEAR;
+}
+#+END_SRC
+    clear_inode関数はBUG_ONを使い、バグがあった場合はカーネルパニックを起こすようにし、致命的な自体が起こる前にカーネルが
+    死ぬようになっています。（BUG_ONは様々な場面で使われています）
+    最終的に、inode構造体のi_stateにI_FREEINGとI_CLEARの論理和を代入しています。
+    I_FREEINGはおそらく解放中であることを島します。I_CLEARは詳解Linuxカーネル第3版によると、意味のある情報を持っていないことを示すそうです。
+*** 11~12行目
+    inode->nlinkには、inodeが指すファイルが何個ハードリンクされているかの数です。
+    なので、今回はinode->nlinkが0出ない場合、本当に削除はせず、終了します。
+*** 13行目
+    上で説明しているfind_inode関数を使って、inode番号から、bfs_inode構造体へのポインタを取得しています。
+*** 14~15行目
+    find_inode関数が失敗した場合は、di変数に-EIOが格納されるため、それをIS_ERR関数で判定している。
+    失敗していた場合は、なにもせず終了となる。
+*** 16行目
+    ここからは、inode情報を削除したりするので排他状態で処理を行う必要が出てきます。なので、ミューテックスでロックします。
+*** 17行目（コメント）
+    "/* clear on-disk inode */"と書かれています。意味としては、ディスク上のinodeを削除するといったところでしょうか.
+*** 18行目
+    diが指しているbfs_inode構造体が書き込まれたメモリ領域を0クリアしています。
+*** 19行目
+    mark_buffer_dirty関数にバッファキャッシュを表すbhを渡しています。
+    バッファの内容とディスクの内容に差異が出たことを示すため、バッファをdirty状態にしています。
+*** 20行目
+    brelse関数を使ってbhを解放しています。（正しくは参照カウンタを減少させる）
+*** 21~27行目
+**** 21行目
+     bfs_inode_info構造体のi_dsk_inoはそのinodeのinode番号が格納されています。diはゼロクリアされましたが、biはゼロクリア
+     されていません。したがって21行目のifはi_dsk_inoが0以外ならば真となります。0以外なんてあるのかと思うのですが、0は未使用を表します。
+     つまり、inodeが使用済みの場合、ここの条件は真になります。
+**** 22行目
+     bfs_inode_info構造体のi_sblockには、inodeが指すファイルのディスク上の開始ブロックの論理番号が格納されています。
+     この値が0ではない場合に、後で詳しく説明しますが、空きブロックの数を増やしています。
+     i_sblockが0では無いということは、これまた未使用、inodeが未使用ではない場合（ファイルが関連付けられている場合）です。
+**** 23行目
+     inodeを削除するということはファイルを削除することとほぼ同じ意味なので、inodeを削除すると、空きブロックの数が増えます。
+     そのために、増えるであろう空きブロックの数を計算し、bfs_sb_info構造体のsi_freebに加算しています。
+     増加する空きブロックの計算法は明らかですが、一応説明しておきます。
+     増加する空きブロック = ファイルの終点ブロックの論理番号 - ファイルの始点ブロックの論理番号 + 1
+**** 24行目
+     bfs_sb_info構造体のsi_freeiは未使用inode数が格納されています。これを1だけインクリメントとしています。
+**** 25行目
+     bfs_sb_info構造体のsi_imapはinodeの使用状況を表すビットマップで、これから解放するinodeのinode番号番目のbitを
+     0にすることによって更新しています。
+**** 26行目
+     bfs_fill_super関数でも使われてたように、デバッグのため、si_imapを出力しています。補足のメッセージには
+     "delete_inode"と出力しています。
+*** 28~32行目（コメント）
+#+BEGIN_SRC c
+/*
+ * If this was the last file, make the previous block
+ * "last block of the last file" even if there is no
+ * real file there, saves us 1 gap.
+ */
+# 筆者による日本語訳
+/*
+ *もし、このinodeが指しているファイルが最後のファイルを指していた場合、１つ前のブロックを、
+ *そこに実際のファイルが存在していなくても、最後のファイルの最後のブロックとして、保存します。
+ */
+#+END_SRC
+    これを踏まえて次の2行を読んでいきます。
+*** 33~34行目
+    info->si_lf_eblk == bi->i_eblock
+    この条件式は、このファイルシステムの最後のファイル（最も大きな論理番号のブロックに書き込まれている）の終点ブロックの論理番号と
+    これから削除する終点ブロックの論理番号が等しかった場合に真となります。
+    もしも、真であった場合は、bfs_sb_info構造体のsi_lf_eblkに上部のコメントにかかれているとおりの値を計算し、値を代入しています。
+    これにより、削除されるファイルが最後のブロックとして記録され続けることを防いでいます。
+*** 35行目
+    データの書き換えは終了したので、mutex_unlockを行い、排他状態を解除します。
+    inode情報の破棄はそのうちカーネルによって行われます。
+    
+** bfs_put_super関数
+*** 概要
+    処理内容をざっと見ると、ファイルシステムの後始末をしているように見えます。
+    おそらくそんな使いみちなのでしょう。ではソースコードを見ていきます。
+*** 引数
+**** 第一引数
+     struct super_block *s
+     super_block構造体へのポインタであるs変数を受け取っています。
+*** 返り値
+    なし
+*** 1行目
+    bfs_sb_info構造体へのポインタ型のinfo変数を宣言し、BFS_SB関数を使って引数として受け取ったsから
+    bfs_sb_info構造体へのポインタを取り出し、代入しています。
+*** 2~3行目
+    1行目で取り出したbfs_sb_info構造体へのポインタが格納されたinfo変数の中身がNULLであった場合、何もせず終了するという処理です。
+*** 4行目
+    bfs_fill_super関数で初期化されていた、bfs_sb_info構造体のbfs_lockを破棄しています。
+*** 5行目
+    bfs_sb_info構造体のinode使用状況ビットマップであるsi_imapはkzallocで動的に確保されているので、kfreeで解放しています。
+*** 6行目
+    super_block構造体のs_fs_infoもbfs_fill_super関数でkzmallocを使って動的確保されているので、kfreeで解放しています。
+*** 7行目
+    super_block構造体のs_fs_infoは解放されたため、不正アクセスを防ぐため、NULLを代入しています。
+** bfs_statfs関数
+*** 概要
+    おそらくこの関数はLinuxのシステムコールであるstatfsのコールバック関数だと思われます。statfsはファイルシステムの情報を
+    得るシステムコールなので、ファイルシステムモジュールとしては、自らの情報を引数で受け取っているstruct kstatfs *bufに
+    詰め込むことが仕事内容となります。
+*** 引数
+**** 第一引数
+     struct dentry *dentry
+     statfsシステムコールの第一引数であるパスを解析し、その解析結果のディレクトリのディレクトリエントリです。
+**** 第二引数
+     struct kstatfs *buf
+     このkstatfs構造体へのポインタを通して、ユーザ側にファイルシステムの情報を伝えます。
+     なので、この変数が指す構造体に値を詰めていく形になります。
+*** 返り値
+    終了ステータス
+    通常、値を読み込み、渡すだけなので、正常終了である0を返します。
+*** 1行目
+    super_block構造体へのポインタ型の変数sを宣言します。そこにdentryのメンバであるd_sbを代入しています。
+    dentry構造体の宣言のd_sbの部分のコメントを見ると次のように書かれています。
+    "struct super_block *d_sb;	/* The root of the dentry tree */"
+    super_block構造体なのになぜ、"この構造体の示すディレクトリエントリのルート"と書かれているのでしょうか。よくわかりません。
+    とりあえず、super_block構造体ということは、このファイルシステムのスーパブロックを示しているsuper_block構造体であることは
+    間違いないので、そういうことにしておきましょう。ということで、sには、このファイルシステムのsuper_block構造体へのポインタが
+    格納されます。
+*** 2行目
+    bfs_sb_info構造体へのポインタ型の変数であるinfoを宣言しています。infoにはsからBFS_SBを使用して取り出したbfs_sb_info構造体
+    を代入しています。
+*** 3行目
+    64bit符号無し整数型の変数idを宣言します。この変数には初期値として、huge_encode_dev関数に引数として、s->s_bdev->bd_devを
+    渡したものの結果を代入しています。s_bdevはblock_device構造体で、bd_devはdev_t型です。dev_t型はLinuxにおいて、デバイス番号を
+    示します。では、huge_encode_dev関数の処理がよくわからないので、ソースコードを見ることにします。
+#+BEGIN_SRC c
+/////
+// include/linux/kdev_t.h new_encode_dev関数
+/////
+static inline u32 new_encode_dev(dev_t dev)
+{
+        unsigned major = MAJOR(dev);
+	      unsigned minor = MINOR(dev);
+	      return (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12);
+}
+
+/////
+// include/linux/kdev_t.h huge_encode_dev関数
+/////
+static inline u64 huge_encode_dev(dev_t dev)
+{
+        return new_encode_dev(dev);
+}
+#+END_SRC
+     dev_t型には、デバイスのメジャー番号とマイナー番号が含まれており、Linuxではdev_t型の下位1~20bitはマイナー番号、
+     残りの上位bitにはメジャー番号が書き込まれています。MAJOR、MINORマクロはdev_tからメジャー番号、マイナー番号を
+     取り出すマクロです。ソースを見る限り、これらの番号を新しいフォーマットに組み直し、それを返しているように見えます。
+
+
+* グローバルな構造体変数
+*** file_system_type構造体
+*** 概要
+    ファイルシステムの基本的な情報や、これまた基本的なコールバック関数のポインタなどを保持する構造体です。
+    LinuxのVFSによって提供され、定義はinclude/linux/fs.hに書かれています。
+    LinuxのBFSではfs/bfs/inode.cでC99の文法を使ってグローバル変数として初期化されています。
+
+# file_system_type構造体のソースコード
+#+BEGIN_SRC c
+
+/////
+// include/linux/fs.h file_system_type構造体
+// VFSによって定義されるファイルシステムの基本情報を保持する構造体
+/////
+struct file_system_type {
+        const char *name;
+	      int fs_flags;
+
+#define FS_REQUIRES_DEV		1 
+#define FS_BINARY_MOUNTDATA	2
+#define FS_HAS_SUBTYPE		4
+#define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+#define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+
+        struct dentry *(*mount) (struct file_system_type *, int,
+		    const char *, void *);
+	      void (*kill_sb) (struct super_block *);
+	      struct module *owner;
+	      struct file_system_type * next;
+	      struct hlist_head fs_supers;
+
+	      struct lock_class_key s_lock_key;
+	      struct lock_class_key s_umount_key;
+	      struct lock_class_key s_vfs_rename_key;
+	      struct lock_class_key s_writers_key[SB_FREEZE_LEVELS];
+        
+	      struct lock_class_key i_lock_key;
+	      struct lock_class_key i_mutex_key;
+	      struct lock_class_key i_mutex_dir_key;
+};
+
+#+END_SRC
+*** フィールド
+**** nameフィールド
+     ファイルシステムごとの固有の名前で、いわゆるファイルシステム名です。
+     mountコマンド等でファイルシステムをマウントするとき、この名前で、
+     担当するファイルシステムモジュールを決定します。
+     LinuxのBFS実装では"bfs"という名前が設定されています。
+**** fs_flagsフィールド
+     ファイルシステムの特性などをこのフラグに登録しておきます。
+     フラグの種類はマクロで定義されており、FS_なんとかで5つ定義されています。
+     | マクロ                | 説明                                                                     |
+     | FS_REQUIRES_DEV       | ブロックデバイス向けのファイルシステム                                   |
+     | FS_BINARY_MOUNTDATA   | マウントオプションをバイナリで解釈するようになる。セキュリティ関連で使用 |
+     | FS_HAS_SUBTYPE        | FUSEやFUSEBLKで実装したファイルシステムと区別するためのフラグ            |
+     | FS_USERNS_MOUNT       | ユーザ名前空間のルートとしてマウントすることができる。                   |
+     | FS_RENAME_DOES_D_MOVE | ファイルシステムがリネームを行っているとき、内部でd_moveを行う。         |
+     LinuxのBFS実装では、ブロックデバイス向けのファイルシステムであることを伝えるため、FS_REQUIRES_DEVマクロをセットしています。
+**** mountフィールド
+     マウントシステムコールが呼ばれたときのコールバック関数です。
+     実装では、fs/bfs/inode.cに定義されたbfs_mount関数へのポインタが設定されています。
+**** ownerフィールド
+     struct module *owner;
+     ファイルシステムのモジュールを表し、基本的にはTHIS_MODULEマクロで初期化します。
+**** kill_sbフィールド
+     スーパブロックオブジェクトを破棄するコールバック関数です。
+**** nextフィールド
+     struct file_system_type *next;
+     register_filesystemやunregister_filesystem関数の説明で登場したファイルシステムモジュール情報の連結リストにおける、
+     自分の次のファイルシステムのfile_system_type構造体へのポインタです。
+**** fs_supersフィールド
+     このファイルシステムタイプでマウントされているスーパーブロックオブジェクトのハッシュリストです。
+     例えば、ext2ファイルシステムが複数のマウントポイントにマウントされているときに、
+     それぞれのスーパーブロックオブジェクトがハッシュリストに登録されます。 
+**** その他のlock_class_key型のフィールド
+     lockdepによりスピンロック、ミューテックス、セマフォなどの依存性をチェックして
+     デッドロックなどのを検出するためのカーネルデバッグ用メンバーになります。
