@@ -4,11 +4,18 @@ Linux kernel 4.14.5を対象にfs/bfsを詳しく解説しています。
 
 * BFSってなに？
   BFSはBoot File Systemの略。
+
   UnixWareのブートのために使われていたファイルシステム。
 
 * BFSの特徴
   基本的にルートディレクトリ以外のディレクトリはサポートしていない。
+
   それ故、仕様や実装がシンプルになる。
+
+* 閲覧において
+  Linux kernel 4.14.5のfs/bfs下に存在するソースファイルを見ながらこの文書を閲覧することを推奨します。
+  
+  この文書は読者の手元にLinuxのBFS実装のソースコードがあるという前提で話を進めていきます。
 
 * 現在の進度
   | ソースファイル | 進度 |
@@ -19,12 +26,17 @@ Linux kernel 4.14.5を対象にfs/bfsを詳しく解説しています。
 * 参考文献等
 ** 書籍
    「詳解Linuxカーネル　第3版」 O'Reilly Japan
+
    「Linuxデバイスドライバプログラミング」 SBクリエイティブ
+
    「オペレーティングシステム 第3版」 ピアソンエデュケーション
+
    「Linuxカーネル2.6解読室」 SBクリエイティブ
 ** Webページ
    「Linux Kernel Hack Japan」 URL:http://www.kerneldesign.info/wiki/index.php?%A4%E8%A4%A6%A4%B3%A4%BD
+
    「Linuxカーネルメモ」 URL:http://wiki.bit-hive.com/linuxkernelmemo/
+
    「The BFS filesystem structure」 URL:http://martin.hinner.info/fs/bfs/bfs-structure.html
    
 
