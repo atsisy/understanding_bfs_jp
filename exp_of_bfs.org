@@ -2227,3 +2227,7 @@ struct super_operations {
 **** statfs関数
      int (*statfs) (struct dentry *, struct kstatfs *);
      statfsシステムコールのコールバック関数
+** kmem_cache構造体
+*** 概要
+    カーネルのキャッシュを指し示すキャッシュディスクリプタを保持する。
+    キャッシュの入り口のようなもの。
