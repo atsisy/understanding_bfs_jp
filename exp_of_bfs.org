@@ -1795,6 +1795,236 @@ typedef struct {
 *** 13行目
     正常終了を示す0を返しています。
 
+** bfs_iget関数
+*** 概要
+    この関数は非常にfind_inode関数に似ています。どちらの関数もinodeを取り出し、返すという処理を行っています。
+    この二つの関数について、大まかな違いを以下に記します。
+    find_inode:
+        あくまでもbfs_inode_write関数のサブ関数。自身は取り出したinodeに対し編集を行わない。
+        inode自体の使用状態について感知しない。
+    bfs_iget関数:
+        super_operations構造体のメンバになっている。ディスクからinodeを取り出し、自ら確保したinodeの編集も行う。
+*** 引数
+**** 第一引数
+     struct super_block *sb
+     このファイルシステムのスーパブロックを表す構造体。inodeを取得する際に利用する。
+**** 第二引数
+     unsigned ino
+     inode取得に使用するinode番号。このinode番号がすでにキャッシュされている場合はすぐにそのキャッシュを返し、
+     なければalloc_inode関数を呼び出し、inodeを確保する。alloc_inode関数については後で説明します。
+*** 返り値
+    指定したinode番号のinode構造体へのポインタ
+*** 1~4行目
+    変数宣言を行っています。型はコードを見ればだいたい解ると思います。
+*** 5行目
+    inode構造体へのポインタであるinode変数にiget_locked関数の結果を格納しています。
+    引数にはスーパブロックを表すsbとinode番号が格納されているinoを代入しています。ここで軽くiget_locked関数について説明します。
+**** iget_locked関数
+     inode構造体を動的確保し、メモリ上に割り当てる前に、引数で指定したinode番号に対応するinode構造体がすでにキャッシュされているかを調べます。
+     もしすでにキャッシュされていれば、そのinode構造体を返します。まだキャッシュされていなければalloc_inodeでinode構造体を割り当て、
+     inode構造体のメンバであるi_state（inodeの状態を示す）をI_NEW（inodeオブジェクトは割り当てられたが、データが入っていない状態）
+     にしてロックします。割り当てられたinode構造体は、ハッシュリストに登録されることになります。結果、その確保したinodeを返します。 
+*** 6~7行目
+    確保したinodeがNULLだった場合、-ENOMEMエラーを返します。
+**** alloc_inode関数（余談）
+     iget_locked関数の実装を見て見ると、失敗時にNULLが返ることがわかります。
+     iget_locked関数内で呼び出されているalloc_inode関数が失敗すると、NULLが返り、iget_locked関数内で、結果がNULLの場合、そのまま返すようになっています。
+     alloc_inode関数は興味深いというか、面白い実装になっています。
+#+BEGIN_SRC c
+/////
+// fs/inode.c alloc_inode関数
+// inode確保処理の本体
+/////
+static struct inode *alloc_inode(struct super_block *sb)
+{
+         struct inode *inode;
+
+	       if (sb->s_op->alloc_inode)
+		             inode = sb->s_op->alloc_inode(sb);
+	       else
+		             inode = kmem_cache_alloc(inode_cachep, GFP_KERNEL);
+
+	       if (!inode)
+		             return NULL;
+
+	       if (unlikely(inode_init_always(sb, inode))) {
+		             if (inode->i_sb->s_op->destroy_inode)
+			           inode->i_sb->s_op->destroy_inode(inode);
+		     else
+			           kmem_cache_free(inode_cachep, inode);
+		             return NULL;
+	       }
+
+	       return inode;
+}
+#+END_SRC
+     この関数のsb->s_op->alloc_inodeを見てください。最初のif文のところです。これは、super_block構造体のsuper_operations構造体の
+     alloc_inode関数です。これはbfs_fill_super関数で登録したsuper_operations構造体で、そのalloc_inodeは、bfs_alloc_inode関数
+     ということになります。つまり、bfs_alloc_inode関数はこんなところで動作していたわけです。このような実装方法はファイルシステムを構築
+     する上で何度も出てきます。この実装方法によって汎用性が非常に向上します。
+*** 8~9行目
+    取得したinode構造体のi_stateフィールドにI_NEWビットフラグが立っているか調べています。今回は、I_NEWビットフラグが立っていない場合、真
+    になります。つまり、取得したinodeにすでに情報が入っていた場合、すぐにそのinodeを返します。
+*** 10~12行目
+    ここで、指定されたinode番号が不正かどうかを調べています。
+    二つの条件でそれを調べており、１つ目は、指定したinode番号がルートディレクトリのinode番号よりも小さいかです。
+    ルートディレクトリのinode番号は必ず2になり、最も小さい値を取らなければならないので、これより小さい場合は不正です。
+    ２つ目は指定したinode番号が、ファイルシステムが取り得る最大のinode番号よりも大きいかどうかです。
+    ファイルシステムが取り得る最大のinode番号よりも大きい場合、不正となります。
+    もしも、inode番号が不正だった場合、デバッグ用メッセージを出力してerrorラベルにジャンプします。
+    デバッグ用メッセージではinodeが所属しているファイルシステムのブロック型デバイス名と指定されていたinode番号を出力します。
+*** 13行目
+    block変数はint型の変数で、この行では、取得したinodeが書き込まれているブロックの論理番号を代入してます。
+    計算手順としては、指定されたinode番号から2を引き、1ブロック当たりのinode数で割ります。0ブロック目は
+    スーパブロックで、inodeは書き込まれないので、1を足します。これでinodeが書き込まれているブロック論理番号が
+    計算出ます。
+*** 14行目
+    buffer_head構造体へのポインタであるbhにsb_bread関数で取得したブロックのデータのメモリ領域へのポインタを格納しています。
+    sb_breadの引数にはinode->i_sbに格納されているsuper_block構造体へのポインタと、上の行で求めたinodeが書き込まれている、
+    ブロックの論理番号です。
+*** 15~19行目
+    sb_bread関数が失敗しているかどうかを確認しています。（sb_bread関数は失敗するとNULLを返します。）
+    失敗していた場合、11行目と同じ情報を出力します。エラーメッセージは違うものになっています。
+    最終的にerrラベルにジャンプするようになっています。
+*** 20行目
+    int型で宣言されているoff変数に、inodeが書き込まれているブロックの中で、何番目に書き込まれているかを計算し、格納しています。
+    計算手順としては、指定されたinode番号から2を引き、1ブロック当たりに書き込むことができるinodeの数との剰余を求め、それに1を足すことで求められます。
+    これをoffに格納するわけです。
+*** 21行目
+    buffer_head構造体のb_dataフィールドはキャッシュされたデータへのポインタとなります。
+    なので、今回の処理は、読み込んだ1ブロック分のデータへの先頭ポインタに上の行で計算したオフセットを足すことで、
+    指定されたinodeが存在すべき位置の先頭ポインタを計算しています。そしてその値をbfs_inode構造体へのポインタに
+    キャストし、bfs_inode構造体へのポインタ型の変数であるdiに格納しています。
+*** 22行目
+    inode構造体のi_modeフィールドは、指し示すファイルのモードについての情報(rwxrwxrwxなど)を格納します。
+    この情報はBFSの性質上、下位9bitのみ使います。なのでbfs_inode構造体のi_modeは下位9bitに情報が書き込まれています。
+    おそらく余分な情報をはじくため、0x0000FFFFでマスクしているのだと考えられます。
+    とりあえず、inode構造体のi_modeに格納される値はわかったと思います。
+*** 23行目
+    le32_to_cpu(di->i_vtype) == BFS_VDIR
+    という条件式を評価しています。i_vtypeはファイルの属性を表します。属性はBFSの場合、ファイルかディレクトリかどちらかです。
+    上の条件式が意味するところは、ファイルの属性がディレクトリを示しているかどうかというものです。ディレクトリを表していれば真になります。
+*** 24~26行目
+    S_IFDIRはinclude/uapi/linux/stat.hで定義されている定数で、意味としては、指定されたinodeはディレクトリを指している
+    ということを示します。このブロックに入ったと言うことは、取得したinodeがディレクトリを指しているということなので、
+    inode構造体のi_modeフィールドにS_IFDIRをマスクしているわけですね。
+    次の二行は、何らかの関数（ポインタ）を代入しているようですが、これはdir.cに定義されているので、ここでの解説は行いません。
+*** 27行目
+    23行目とは対照的にここではBFS_VREGとの比較を行っています。BFS_VREGはファイル属性を表すので、取り出したinodeが指すオブジェクトが
+    ファイルだった場合、真になります。
+*** 28~31行目
+    S_IFREGはinclude/uapi/linux/stat.hで定義されている定数で、意味としては指定されたinodeはあ通常ファイルを指している
+    ということを示します。このブロックに入ったと言うことは、取得したinodeが通常ファイルを指しているということなので、
+    inode構造体のi_modeフィールドにS_IFREGをマスクしているわけですね。
+    次の三行は、何らかの関数（ポインタ）を代入しているようですが、これはfile.cに定義されているので、ここでの解説は行いません。
+*** 32~45行目
+    この行では、inode構造体にデータをセットしています。
+**** 32行目
+     BFS_Iでinodeへのポインタが格納されているbfs_inode構造体を取り出しています。このi_sblockフィールドにディスクから読みっとった
+     bfs_inodeのi_sblockを代入しています。i_sblockにはinodeが指すファイルの開始地点のブロックの論理番号が入ります。
+**** 33行目
+     BFS_Iでinodeへのポインタが格納されているbfs_inode構造体を取り出しています。このi_eblockフィールドにディスクから読みっとった
+     bfs_inodeのi_eblockを代入しています。i_eblockにはinodeが指すファイルの終了地点のブロックの論理番号が入ります。
+**** 34行目
+     BFS_Iでinodeへのポインタが格納されているbfs_inode構造体を取り出しています。このi_dsk_inoフィールドにディスクから読みっとった
+     bfs_inodeのi_inoを代入しています。i_dks_inoにはinode番号を格納することになっています。
+**** 35行目
+     i_uid_write関数を呼び出しています。その実装を見れば自明なことなのですが、この関数によってinode構造体のi_uidフィールドに
+     kuid_t型にキャストされたbfs_inode構造体のi_uidフィールドが代入されます。
+**** 36行目
+     i_gid_write関数を呼び出しています。35行目と同様に、kgid_t型にキャストされたbfs_inode構造体のi_gidフィールドが代入されます。
+**** 37行目
+     set_nlink関数を呼び出しています。これは、inode構造体のi_nlink（リンク数を表す）の値を書き換える関数なんですが、実装が簡潔なのでソースコードを読んでみることにします。
+#+BEGIN_SRC c
+/////
+// fs/inode.c set_nlink.c
+/////
+/**
+ * set_nlink - directly set an inode's link count
+ * @inode: inode
+ * @nlink: new nlink (should be non-zero)
+ *
+ * This is a low-level filesystem helper to replace any
+ * direct filesystem manipulation of i_nlink.
+ */
+void set_nlink(struct inode *inode, unsigned int nlink)
+{
+        if (!nlink) {
+		            clear_nlink(inode);
+	      } else {
+		            /* Yes, some filesystems do change nlink from zero to one */
+		            if (inode->i_nlink == 0)
+		                    atomic_long_dec(&inode->i_sb->s_remove_count);
+
+		            inode->__i_nlink = nlink;
+	      }
+}
+#+END_SRC
+     まず、第二引数に受け取った新しいリンク数が0だった場合、clear_nlink関数を呼び出しています。この関数は。inodeのi_nlinkを0にセットします。
+     0出ない場合。最初のif分は飛ばしましょう。その次にあるコードはinode構造体の__i_nlinkフィールドにnlinkを代入しています。
+     でも、__i_nlinkなんていうメンバはinode構造体にあったでしょうか。これが面白いポイントです。inode構造体の定義の一部を取り出します。
+#+BEGIN_SRC c
+/*
+ * Filesystems may only read i_nlink directly.  They shall use the
+ * following functions for modification:
+ *
+ *    (set|clear|inc|drop)_nlink
+ *    inode_(inc|dec)_link_count
+ */
+union {
+        const unsigned int i_nlink;
+		    unsigned int __i_nlink;
+};
+#+END_SRC
+     このように、リンク数を管理する変数は共用体で2つの変数名でアクセスできるようになっています。
+     ここで面白いのは、i_nlinkはconstで宣言され、__i_nlinkはconstではありません。
+     上部のコメントを流し読みすると、基本的にi_nlinkは読み込み専用で、値を書き換えるときだけ、専用の関数を使い、
+     __i_nlinkにアクセスし、値を書き換えるようです。これで誤って値を書き換えてしまうことを防いでいるようです。
+     ひとまず、これでinodeのリンク数を書き換えることができました。
+**** 38行目
+     inode構造体のi_sizeフィールドに、読み取ったinodeの指すファイルの大きさを代入しています。
+     ファイルサイズの求める方法は、ファイルのEOFまでのバイトオフセットからファイルの開始位置のバイトオフセットを
+     引いくことで計算してます。
+**** 39行目
+     inode構造体のi_blocksフィールドに、読み取ったinodeの指すファイルがまたがっているブロック数を代入しています。
+     計算方法は、ファイルの開始地点のブロックと終了地点のブロックの論理番号の差に1を足すことで求めています。
+**** 40~42行目
+     ファイルのアクセス時間、編集時間、作成時間をUNIX時間の通算秒で代入しています。
+**** 43~45行目
+     ナノ秒でのアクセス時間、編集時間、作成時間は対応しないため、0を代入しています。
+
+*** 46行目
+    inode取得に使ったキャッシュであるbh変数を解放しています。
+*** 47行目
+    新しく取得したinodeはiget_lockedで得たため、ロックがかかっています。これを解除しています。
+    実装としては、i_NEWビットフラグをおろしています。一応ソースコードを示しておきます。
+#+BEGIN_SRC c
+/////
+// fs/inode.c unlock_new_inode関数
+/////
+/**
+ * unlock_new_inode - clear the I_NEW state and wake up any waiters
+ * @inode:	new inode to unlock
+ *
+ * Called when the inode is fully initialised to clear the new state of the
+ * inode and wake up anyone waiting for the inode to finish initialisation.
+ */
+void unlock_new_inode(struct inode *inode)
+{
+        lockdep_annotate_inode_mutex_key(inode);
+	      spin_lock(&inode->i_lock);
+	      WARN_ON(!(inode->i_state & I_NEW));
+	      inode->i_state &= ~I_NEW;
+	      smp_mb();
+	      wake_up_bit(&inode->i_state, __I_NEW);
+	      spin_unlock(&inode->i_lock);
+}
+#+END_SRC
+*** 48行目
+    値の書き込みが終了したinode構造体へのポインタを返却しています。
+*** errorラベル
+    iget_faild関数を呼び出し、inode構造体を不良inodeとして初期化します。
+    その後、EIOエラーコードを返却し、終了します。
 * グローバルな構造体変数
 *** file_system_type構造体
 *** 概要
