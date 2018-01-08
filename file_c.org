@@ -1,0 +1,108 @@
+#+TITLE: Boot File SystemのLinux実装を読む file.c編
+
+Linux kernel 4.14.5のfs/bfs/file.cを対象にソースコードを読んでいきます。
+
+* ブロック操作
+** bfs_move_block関数
+*** 概要
+    あとで書く
+*** 引数
+    あとで書く
+*** 返り値
+    あとで書く
+*** 1行目
+    バッファキャッシュを指し、参照カウントを保持する構造体であるbuffer_head構造体へのポインタ型変数の
+    bh、newを宣言しています。
+*** 2行目
+    sb_bread関数でバッファキャッシュを作り出しています。sb_bread関数に渡す引数は、
+    bfs_move_block関数が受け取った引数であるsuper_block構造体のsb、ブロックの論理番号が
+    格納されているfromを渡している。これにより、fromが指す1ブロック分のデータをメモリにキャッシュできます。
+*** 3~4行目
+    sb_breadが失敗した場合、NULLが帰ってきます。NULLが帰ってきていた場合、EIOエラーコードを返して終了します。
+*** 5行目
+    sb_getblk関数が使われています。この関数の動作がいまいちわからないので、ソースコードを見てみることにします。
+#+BEGIN_SRC c
+/////
+// include/linux/buffer_head.h sb_getblk関数
+/////
+static inline struct buffer_head *
+sb_getblk(struct super_block *sb, sector_t block)
+{
+	return __getblk_gfp(sb->s_bdev, block, sb->s_blocksize, __GFP_MOVABLE);
+}
+
+/////
+// fs/buffer.c __getblk_gfp関数
+// sb_getblk関数から呼び出されている
+/////
+/*
+ * __getblk_gfp() will locate (and, if necessary, create) the buffer_head
+ * which corresponds to the passed block_device, block and size. The
+ * returned buffer has its reference count incremented.
+ *
+ * __getblk_gfp() will lock up the machine if grow_dev_page's
+ * try_to_free_buffers() attempt is failing.  FIXME, perhaps?
+ */
+struct buffer_head *
+__getblk_gfp(struct block_device *bdev, sector_t block,
+	     unsigned size, gfp_t gfp)
+{
+	struct buffer_head *bh = __find_get_block(bdev, block, size);
+
+	might_sleep();
+	if (bh == NULL)
+		bh = __getblk_slow(bdev, block, size, gfp);
+	return bh;
+}
+#+END_SRC
+    __getblk_gfp関数の上部のコメントを読むと、どうやらbuffer_head構造体を確保する関数のようです。
+    また、sb_breadが呼び出している__bread_gfpのソースを見てみると、その中で__getblk_gfpを呼び出しています。
+    なので、だいたい同じ処理をしますが、違いは、キャッシュされているかを調べているかがsb_getblkで、
+    調べないのがsb_breadかと思われます。
+*** 6行目
+    buffer_head構造体のb_sizeフィールドにはブロックのサイズが格納されているため、
+    newが指すキャッシュにbhのキャッシュを上書きすることになります。
+*** 7行目
+    newが指すキャッシュに変更があり、ディスクの情報と矛盾が生じていること通知します。
+*** 8行目
+    bforget関数は初出ですので、ソースを詳しく見ていきます。
+    基本的な動作はbrelseに似ています。
+#+BEGIN_SRC c
+/////
+// include/linux/buffer_head.h bforgot関数
+/////
+static inline void bforget(struct buffer_head *bh)
+{
+	if (bh)
+		__bforget(bh);
+}
+
+/////
+// fs/buffer.c __bforget関数
+/////
+/*
+ * bforget() is like brelse(), except it discards any
+ * potentially dirty data.
+ */
+void __bforget(struct buffer_head *bh)
+{
+	clear_buffer_dirty(bh);
+	if (bh->b_assoc_map) {
+		struct address_space *buffer_mapping = bh->b_page->mapping;
+
+		spin_lock(&buffer_mapping->private_lock);
+		list_del_init(&bh->b_assoc_buffers);
+		bh->b_assoc_map = NULL;
+		spin_unlock(&buffer_mapping->private_lock);
+	}
+	__brelse(bh);
+}
+#+END_SRC
+    コメントを見る限り、bforgot関数は、brelseとは異なり、その場ですぐにそのデータを破棄するようです。
+    それは、誰かがそのキャッシュを参照していたとしても削除します。ここがbrelse関数とは異なる点です。
+*** 9行目
+    brelse関数でnewを解放します。これはbrelseでの解放なので、誰かがこのキャッシュを参照
+    していた場合、すぐには解放されません。
+*** 10行目
+    エラーは起きなかったので、0を返却します。
+    

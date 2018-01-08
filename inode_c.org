@@ -1,6 +1,6 @@
-#+TITLE: Boot File SystemのLinux実装を読む
+#+TITLE: Boot File SystemのLinux実装を読む inode.c編
 
-今回はLinux kernel 4.14.5のfs/bfsを対象にソースコードを読んでいきます。
+Linux kernel 4.14.5のfs/bfs/inode.cを対象にソースコードを読んでいきます。
 
 * カーネルモジュールとしての初期化と終了
   ファイルシステムを管理する処理はカーネル空間で実行されることになりますが、現代は様々なファイルシステムが多数存在しており、
