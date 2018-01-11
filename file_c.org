@@ -151,3 +151,132 @@ void __bforget(struct buffer_head *bh)
      エラーメッセージには、コピーに失敗したブロックの論理番号を出力します。
 **** 8行目
      何事も無く終了したため、0を返し、成功を伝えます。
+* ページ処理
+** bfs_readpage関数
+*** 概要
+    引数で渡されるpage構造体が指すページに対応するブロックからデータを読み取り、
+      そのデータをページキャッシュに格納する処理をベースとして、BFS独自に実装を行う。
+*** 引数
+**** 第一引数
+     struct file *file
+     今回は使用しません。
+**** 第二引数
+     struct page *page
+     データを格納するページを表すpage構造体へのポインタ
+*** 返り値
+    基本的に0を返します。
+*** 1行目
+    block_read_full_page関数を呼び出しています。その結果を返し、終了です。
+    この関数に渡している引数は、ページキャッシュを指すpage構造体へのポインタと、
+    BFSのブロックを読み込むための関数であるbfs_get_blockの関数ポインタを渡しています。
+    ここで軽くblock_read_full_page関数について説明を行っていきます。
+**** block_read_full_page関数
+***** 概要
+      引数で渡されるpage構造体が指すページに対応するブロックからデータを読み取り、
+      そのデータをページキャッシュに格納します。
+***** ソースコード
+#+BEGIN_SRC c
+/////
+// fs/buffer.c block_read_full_page関数
+/////
+/*
+ * Generic "read page" function for block devices that have the normal
+ * get_block functionality. This is most of the block device filesystems.
+ * Reads the page asynchronously --- the unlock_buffer() and
+ * set/clear_buffer_uptodate() functions propagate buffer state into the
+ * page struct once IO has completed.
+ */
+int block_read_full_page(struct page *page, get_block_t *get_block)
+{
+	struct inode *inode = page->mapping->host;
+	sector_t iblock, lblock;
+	struct buffer_head *bh, *head, *arr[MAX_BUF_PER_PAGE];
+	unsigned int blocksize, bbits;
+	int nr, i;
+	int fully_mapped = 1;
+
+	head = create_page_buffers(page, inode, 0);
+	blocksize = head->b_size;
+	bbits = block_size_bits(blocksize);
+
+	iblock = (sector_t)page->index << (PAGE_SHIFT - bbits);
+	lblock = (i_size_read(inode)+blocksize-1) >> bbits;
+	bh = head;
+	nr = 0;
+	i = 0;
+
+	do {
+		if (buffer_uptodate(bh))
+			continue;
+
+		if (!buffer_mapped(bh)) {
+			int err = 0;
+
+			fully_mapped = 0;
+			if (iblock < lblock) {
+				WARN_ON(bh->b_size != blocksize);
+				err = get_block(inode, iblock, bh, 0);
+				if (err)
+					SetPageError(page);
+			}
+			if (!buffer_mapped(bh)) {
+				zero_user(page, i * blocksize, blocksize);
+				if (!err)
+					set_buffer_uptodate(bh);
+				continue;
+			}
+			/*
+			 * get_block() might have updated the buffer
+			 * synchronously
+			 */
+			if (buffer_uptodate(bh))
+				continue;
+		}
+		arr[nr++] = bh;
+	} while (i++, iblock++, (bh = bh->b_this_page) != head);
+
+	if (fully_mapped)
+		SetPageMappedToDisk(page);
+
+	if (!nr) {
+		/*
+		 * All buffers are uptodate - we can set the page uptodate
+		 * as well. But not if get_block() returned an error.
+		 */
+		if (!PageError(page))
+			SetPageUptodate(page);
+		unlock_page(page);
+		return 0;
+	}
+
+	/* Stage two: lock the buffers */
+	for (i = 0; i < nr; i++) {
+		bh = arr[i];
+		lock_buffer(bh);
+		mark_buffer_async_read(bh);
+	}
+
+	/*
+	 * Stage 3: start the IO.  Check for uptodateness
+	 * inside the buffer lock in case another process reading
+	 * the underlying blockdev brought it uptodate (the sct fix).
+	 */
+	for (i = 0; i < nr; i++) {
+		bh = arr[i];
+		if (buffer_uptodate(bh))
+			end_buffer_async_read(bh, 1);
+		else
+			submit_bh(REQ_OP_READ, 0, bh);
+	}
+	return 0;
+}
+#+END_SRC
+***** 処理の流れ
+      1.buffer_head構造体の初期化（データの読み出し）
+      2.初期化のエラーチェック
+      3.バッファをロックし、同期を行う
+      4.既にバッファが最新状態なら、そのバッファのREAD I/Oが終了したことをカーネルに通知し、
+        そうでなければ、submit_bh関数を使って、カーネルに1ブロック分のデータを要求します。
+	このとき、buffer_head構造体にブロックの論理番号などの情報が入っているので、
+	submit_bhには読み込みを要求するREQ_OP_READとオプション（0）、bhだけを渡しています。
+     
