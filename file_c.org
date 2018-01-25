@@ -155,7 +155,7 @@ void __bforget(struct buffer_head *bh)
 ** bfs_readpage関数
 *** 概要
     引数で渡されるpage構造体が指すページに対応するブロックからデータを読み取り、
-      そのデータをページキャッシュに格納する処理をベースとして、BFS独自に実装を行う。
+    そのデータをページキャッシュに格納する処理をベースとして、BFS独自に実装を行う。
 *** 引数
 **** 第一引数
      struct file *file
@@ -279,4 +279,23 @@ int block_read_full_page(struct page *page, get_block_t *get_block)
         そうでなければ、submit_bh関数を使って、カーネルに1ブロック分のデータを要求します。
 	このとき、buffer_head構造体にブロックの論理番号などの情報が入っているので、
 	submit_bhには読み込みを要求するREQ_OP_READとオプション（0）、bhだけを渡しています。
-     
+** bfs_writepage関数
+*** 概要
+    引数で渡されるpage構造体が指すページに対応するキャッシュを記憶装置と矛盾が無いように書き込む要請
+    をカーネルに行います。これをBFSに対応した形で定義を行います。
+*** 引数
+**** 第一引数
+     struct page *page
+     Dirtyな状態のページキャッシュを指すpage構造体へのポインタ。
+**** 第二引数
+     struct writeback_control *wbc
+     WriteBack処理を管理するためのwriteback_control構造体へのポインタ。
+     WriteBack処理等を自前で実装するときに必要になるため、カーネルから渡される。
+*** 返り値
+*** 1行目
+    block_write_full_page関数を呼び出しています。その結果を返し、終了です。block_read_full_pageと似ています。
+    この関数に渡している引数は、ページキャッシュを指すpage構造体へのポインタと、
+    BFSのブロックを読み込むための関数であるbfs_get_blockの関数ポインタを渡しています。
+**** block_write_full_page関数
+     block_read_full_page関数と同様で、WriteBack処理を行うための関数です。この関数が主に扱う処理は、
+     WriteBack処理の書き込み操作の部分です。渡したDirtyなページの情報の同期をカーネルに要請します。
