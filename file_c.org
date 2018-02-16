@@ -354,8 +354,8 @@ map_bh(struct buffer_head *bh, struct super_block *sb, sector_t block)
 
     この翻訳だと、誤解を生みかねないので、図を作りました。そちらも参考にしてください。
     
-[[./image/get_block1.png]］
-[[./image/get_block2.png]］
+[[./image/get_block1.png]]
+[[./image/get_block2.png]]
 
 *** 49行目
     phys = info->si_lf_eblk + 1
