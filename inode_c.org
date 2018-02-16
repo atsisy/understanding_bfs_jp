@@ -667,10 +667,10 @@ struct buffer_head {
     いろいろと計算した値をinfo変数（bfs_sb_info構造体へのポインタ）のsi_lastiフィールドに代入しています。
     このsi_lastiフィールドはBFSパーティションの最後のinodeのinode番号を表します。名前も少しそれっぽいです。
     このいろいろ計算している部分を理解するためにようやくBFSの構造について見ていきます。（筆者はコードだけでちょろまかそうとして意味分からなくなったので）
-    [[file:~/Dropbox/fs_docs/bfs_table.png]]
+    [[./image//bfs_table1.png]]
     また、詳しいBFSの構造を確認したい場合は、http://martin.hinner.info/fs/bfs/bfs-structure.html にアクセスすると良いでしょう。
     この計算を表す画像を用意したので、これもどうぞ。
-    [[file:~/Dropbox/fs_do0cs/bfs_table2.png]]
+    [[./image/bfs_table2.png]]
     つまり、(le32_to_cpu(bfs_sb->s_start) - BFS_BSIZE)はデータ領域の開始位置(byteオフセット)-1ブロックのサイズ（スーパブロックは1ブロック分のサイズ）
     の計算式で、inode領域のサイズ（byte）が得られます。これをinode１つ当たりのサイズで割れば、inode領域に格納できるinodeの数が得られます。
     ここでもし、inode番号が0から始まっていた場合、inode領域の最後のinodeのinode番号は格納できるinodeの数-1ということになります。
