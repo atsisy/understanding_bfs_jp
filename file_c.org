@@ -1,12 +1,6 @@
 #+TITLE: Boot File SystemのLinux実装を読む file.c編
 
-Linux ke
-
-
-
-
-
-rnel 4.14.5のfs/bfs/file.cを対象にソースコードを読んでいきます。
+Linux kernel 4.14.5のfs/bfs/file.cを対象にソースコードを読んでいきます。
 
 * ブロック操作
 ** bfs_move_block関数
@@ -603,3 +597,43 @@ int block_read_full_page(struct page *page, get_block_t *get_block)
 **** block_write_full_page関数
      block_read_full_page関数と同様で、WriteBack処理を行うための関数です。この関数が主に扱う処理は、
      WriteBack処理の書き込み操作の部分です。渡したDirtyなページの情報の同期をカーネルに要請します。
+** bfs_write_begin関数
+*** 概要
+    ページに書き込む処理の前に、目的のページは確保されているのかなどの確認。
+    必要な際はページの確保などを行う。
+*** 引数
+    | 第一引数 | struct file *file             | このページ操作に関わってくるファイル                      |
+    | 第二引数 | struct address_space *mapping | 書き込むページを表すaddress_spaceオブジェクトへのポインタ |
+    | 第三引数 | loff_t pos                    | 書き込み開始位置のバイト単位でのオフセット                |
+    | 第四引数 | unsigned len                  | 書き込みを行うバイト単位のサイズ                          |
+    | 第五引数 | unsigned flags                | include/linux/fs.hに記述されたフラグ値。詳細は下記        |
+    | 第六引数 | struct page **pagep           | 準備するページのポインタをこの変数に代入する必要がある。  |
+    | 第七引数 | void **fsdata                 | ファイルシステム固有データへのポインタ                    |                                                                                                       |
+**** 第五引数について
+     以下の2種類のフラグが入っています
+#+BEGIN_SRC c
+#define AOP_FLAG_CONT_EXPAND		0x0001 /* called from cont_expand */
+#define AOP_FLAG_NOFS			0x0002 /* used by filesystem to direct
+						* helper code (eg buffer layer)
+						* to clear GFP_FS from alloc */
+#+END_SRC
+*** 返り値
+    正常終了時は0を返し、失敗した場合、0以外の値を返します。
+*** 1行目
+    終了ステータスを保持しておくための変数iを宣言しています。
+*** 2~3行目
+#+BEGIN_SRC c
+    ret = block_write_begin(mapping, pos, len, flags, pagep,
+				bfs_get_block);
+#+END_SRC
+    ここでblock_write_begin関数を呼び出し、その結果をretに代入しています。
+    恐らくこの関数はwrite_begin処理の汎用的な処理を担うものです。
+    ページの探索、確保、ロック処理等を行ってくれます。
+    また、この関数はLinuxのVFS層から提供されていることが予測されます。
+*** 4~5行目
+    unlikelyマクロを使用して、”無いとは思うけど・・・”とコンパイラに知らせています。
+    この場合の条件は、retの値が、0（正常終了）ならばそのままretをreturnして終了。
+    retに何らかのエラーが入っていた場合、次の項目で解説するbfs_write_failed関数を呼び出しています。
+    関数名からして、失敗時の処理を行うっぽいです。
+*** 6行目
+    block_write_begin関数の返り値が入ったretを返しています。
