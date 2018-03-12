@@ -898,3 +898,34 @@ struct inode_operations {
 } ____cacheline_aligned;
 
 #+END_SRC
+* マクロ
+** dprintf
+#+BEGIN_SRC c
+// #undef DEBUG ここでコントロール
+
+#ifdef DEBUG
+#define dprintf(x...)	printf(x)
+#else
+#define dprintf(x...)
+#endif
+#+END_SRC
+   ここです。
+
+   ぱっと見るに、デバッグ状態のときは実行され、その他のときは、特に何も行わないマクロであることがわかります。
+*** 詳細(デバッグ状態の話)
+    dprintfはprintfに置き換えられています。
+    
+    では、printfの定義を見てみましょう。fs/bfs/bfs.hに定義されています。
+    
+#+BEGIN_SRC c
+/////
+// fs/bfs/bfs.h printfマクロ
+/////
+#define printf(format, args...) \
+	printk(KERN_ERR "BFS-fs: %s(): " format, __func__, ## args)
+#+END_SRC
+
+    printkのKERN_ERRでエラー出力を行うマクロです。
+**** トークン連結演算子
+    ここで使われている見慣れない記号、##はトークン連結演算子と呼ばれるれっきとしたC言語の機能です。
+    マクロの定義で使用することができます。とりあえず、強引に右辺と左辺をくっつけることができ、コードにすることができます。

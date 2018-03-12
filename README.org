@@ -23,11 +23,11 @@ Linux kernel 4.14.5を対象にfs/bfsを詳しく解説しています。
   | ソースファイル | 進度 |
   | inode.c        | 100% |
   | dir.c          |   0% |
-  | file.c         |  95% |
+  | file.c         | 100% |
 
 * 参考文献等
 ** 書籍
-   「詳解Linuxカーネル　第3版」 O'Reilly Japan
+   「詳解Linuxカーネル 第3版」 O'Reilly Japan
 
    「Linuxデバイスドライバプログラミング」 SBクリエイティブ
 
