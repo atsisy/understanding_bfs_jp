@@ -711,3 +711,36 @@ void truncate_pagecache(struct inode *inode, loff_t newsize)
      ここでの処理は、bfs_write_begin関数で失敗した場合です。すなわち、bfs_write_beginで、
      新しく確保された可能性のある領域を切り詰めなおしているのではないかと思います。
 
+** bfs_bmap関数
+*** 概要
+    ファイルが書き込まれているブロックの論理番号から、論理ブロック番号を取得するための関数
+*** 引数
+    | 第一引数 | struct address_space *mapping | ファイルのキャッシュページを表すaddress_spaceオブジェクトへのポインタ              |
+    | 第二引数 | sector_t block                | 論理ブロック番号を知りたいブロックまでのファイルのオフセット（ブロックオフセット） |
+*** 返り値
+    | sector_t | 結果の論理ブロック番号 |
+*** 1行目
+    generic_block_bmap関数を呼び出し、その関数の返り値を返して終了です。
+    このgeneric_block_bmap関数は、bmapの汎用的な処理を行ってくれる関数です。
+    つまり、generic_block_bmapが返す論理ブロック番号をそのまま返しているだけです。
+    
+
+    このままだと味気ないので、軽くgeneric_block_bmapのソースコードを流し読みしましょう。
+#+BEGIN_SRC c
+/////
+// fs/buffer.c generic_block_bmap関数
+/////
+sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
+			    get_block_t *get_block)
+{
+	struct inode *inode = mapping->host;
+	struct buffer_head tmp = {
+		.b_size = i_blocksize(inode),
+	};
+
+	get_block(inode, block, &tmp, 0);
+	return tmp.b_blocknr;
+}
+#+END_SRC
+    ここまで読み進めてくれば楽勝ですね。論理番号を求めるために、bfs_get_block関数をを渡しているため、
+    それを使い、論理番号を計算しています。
