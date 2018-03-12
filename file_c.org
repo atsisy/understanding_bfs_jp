@@ -637,3 +637,77 @@ int block_read_full_page(struct page *page, get_block_t *get_block)
     関数名からして、失敗時の処理を行うっぽいです。
 *** 6行目
     block_write_begin関数の返り値が入ったretを返しています。
+** bfs_write_faild関数
+*** 概要
+    bfs_write_begin関数が失敗したときに呼び出される関数
+    上記の関数で無駄に拡張をしてしまった場合のために、領域を切り詰め直す関数
+*** 引数
+    | 第一引数 | struct address_space *mapping | bfs_write_begin関数で書き込む準備をするはずだったページを表す |
+    | 第二引数 | loff_t to                     | 書き込むはずだった領域の終端のバイトオフセット                |
+*** 返り値
+    void
+*** 1行目
+    address_space構造体のhostフィールドは、そのaddress_space構造体と関連付けられているinodeを表す
+    inode構造体変数へのポインタです。なので、その変数を取り出し、ローカルなinode変数に格納しています。
+*** 2~3行目
+#+BEGIN_SRC c
+    to > inode->i_size
+#+END_SRC
+    この条件式が表すことは以下のようなことです。
+#+BEGIN_SRC txt
+    書き込み先の終了地点までのバイトオフセット > inodeが指すファイルのサイズ
+#+END_SRC
+    この条件式がtrueになったとき、truncate_pagecache関数を呼び出しています。
+    
+    以下にtruncate_pagecache関数の定義を記述しておきます。
+#+BEGIN_SRC c
+
+/////
+// mm/trancate.c truncate_pagecache関数
+/////
+/**
+ * truncate_pagecache - unmap and remove pagecache that has been truncated
+ * @inode: inode
+ * @newsize: new file size
+ *
+ * inode's new i_size must already be written before truncate_pagecache
+ * is called.
+ *
+ * This function should typically be called before the filesystem
+ * releases resources associated with the freed range (eg. deallocates
+ * blocks). This way, pagecache will always stay logically coherent
+ * with on-disk format, and the filesystem would not have to deal with
+ * situations such as writepage being called for a page that has already
+ * had its underlying blocks deallocated.
+ */
+void truncate_pagecache(struct inode *inode, loff_t newsize)
+{
+	struct address_space *mapping = inode->i_mapping;
+	loff_t holebegin = round_up(newsize, PAGE_SIZE);
+
+	/*
+	 * unmap_mapping_range is called twice, first simply for
+	 * efficiency so that truncate_inode_pages does fewer
+	 * single-page unmaps.  However after this first call, and
+	 * before truncate_inode_pages finishes, it is possible for
+	 * private pages to be COWed, which remain after
+	 * truncate_inode_pages finishes, hence the second
+	 * unmap_mapping_range call must be made for correctness.
+	 */
+	unmap_mapping_range(mapping, holebegin, 0, 1);   // 筆者追記 unmap
+	truncate_inode_pages(mapping, newsize);          // 筆者追記 切り詰め
+	unmap_mapping_range(mapping, holebegin, 0, 1);   // 筆者追記 再度unmap?
+}
+#+END_SRC
+    関数上部のコメントを読む限り、この関数は、メモリ領域を切り詰められたページキャッシュをunmapし、
+    removeするという役割のようです。
+    つまり、この場合、書き込み先のファイルの先頭からのバイトオフセットが、このinodeが指すファイルの
+    サイズより小さい場合、何もせず終了します。そうでない場合。バイトオフセットがファイルをオーバーラン
+    してしまっている場合、inode構造体に格納されているファイルのサイズに、マッピングされたメモリを切り詰めます。
+**** 思ったこと
+     個人的にこの処理は意味がわからないのですが、なんとなく思ったことを書いておきます。
+     
+
+     ここでの処理は、bfs_write_begin関数で失敗した場合です。すなわち、bfs_write_beginで、
+     新しく確保された可能性のある領域を切り詰めなおしているのではないかと思います。
+
